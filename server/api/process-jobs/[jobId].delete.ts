@@ -1,7 +1,7 @@
 import { getRouterParam } from 'h3'
 import { getOrCreateClientId } from '../../utils/job-client'
 import { serializeJob } from '../../utils/job-response'
-import { cancelJobForOwner } from '../../utils/video-jobs'
+import { removeJobForOwner } from '../../utils/video-jobs'
 
 export default defineEventHandler(async (event) => {
   const ownerId = getOrCreateClientId(event)
@@ -14,7 +14,7 @@ export default defineEventHandler(async (event) => {
     })
   }
 
-  const job = await cancelJobForOwner(jobId, ownerId)
+  const job = await removeJobForOwner(jobId, ownerId)
 
   if (!job) {
     throw createError({

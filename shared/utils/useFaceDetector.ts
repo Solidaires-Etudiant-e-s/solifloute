@@ -3,14 +3,17 @@ import {
   createModelInputData,
   DEFAULT_PROBABILITY_THRESHOLD,
   extractFacesFromOutputs,
-  MODEL_HEIGHT,
-  MODEL_WIDTH,
-  resolveOutputTensors
+  extractFacesFromYunetOutputs,
+  getPaddedInputSize
 } from './faceDetectionCore'
 
-const DEFAULT_MODEL_PATH = import.meta.server
-  ? `${process.cwd()}/public/models/version-RFB-640.onnx`
-  : '/models/version-RFB-640.onnx'
+const isNodeRuntime = typeof window === 'undefined' && typeof process !== 'undefined'
+
+const DEFAULT_MODEL_PATH = isNodeRuntime
+  ? `${process.cwd()}/public/models/centerface.onnx`
+  : '/models/centerface.onnx'
+
+export type FaceDetectionModelType = 'centerface' | 'yunet'
 
 type OrtWebModule = typeof import('onnxruntime-web')
 type OrtNodeModule = typeof import('onnxruntime-node')
@@ -21,12 +24,12 @@ const sessionCache = new Map<string, Promise<InferenceSession>>()
 let ortPromise: Promise<OrtModule> | null = null
 
 function getExecutionProviders() {
-  return import.meta.server ? ['cpu'] : ['wasm']
+  return isNodeRuntime ? ['cpu'] : ['wasm']
 }
 
 async function getOrt() {
   if (!ortPromise) {
-    ortPromise = import.meta.server
+    ortPromise = isNodeRuntime
       ? import('onnxruntime-node')
       : import('onnxruntime-web').then((ort) => {
           ort.env.wasm.wasmPaths = {
@@ -42,7 +45,7 @@ async function getOrt() {
 }
 
 async function loadSession(modelPath: string) {
-  const cacheKey = `${import.meta.server ? 'server' : 'client'}:${modelPath}`
+  const cacheKey = `${isNodeRuntime ? 'server' : 'client'}:${modelPath}`
 
   if (!sessionCache.has(cacheKey)) {
     sessionCache.set(cacheKey, (async () => {
@@ -56,7 +59,10 @@ async function loadSession(modelPath: string) {
   return await sessionCache.get(cacheKey)!
 }
 
-export function useFaceDetector(modelPath = DEFAULT_MODEL_PATH) {
+export function useFaceDetector(
+  modelPath = DEFAULT_MODEL_PATH,
+  modelType: FaceDetectionModelType = 'centerface'
+) {
   return {
     async warmup() {
       await Promise.all([
@@ -80,21 +86,18 @@ export function useFaceDetector(modelPath = DEFAULT_MODEL_PATH) {
         throw new Error('Le modele de detection de visages n a pas de nom d entree.')
       }
 
+      const { width, height } = getPaddedInputSize(input.width, input.height)
       const tensor = new ort.Tensor(
         'float32',
-        createModelInputData(input),
-        [1, 3, MODEL_HEIGHT, MODEL_WIDTH]
+        createModelInputData(input, width, height),
+        [1, 3, height, width]
       )
       const outputs = await session.run({ [inputName]: tensor })
-      const { boxTensor, confidenceTensor } = resolveOutputTensors(outputs, session.outputNames)
 
       return {
-        faces: extractFacesFromOutputs(
-          boxTensor.data as Float32Array,
-          confidenceTensor.data as Float32Array,
-          input,
-          probabilityThreshold
-        ),
+        faces: modelType === 'yunet'
+          ? extractFacesFromYunetOutputs(outputs, input, probabilityThreshold)
+          : extractFacesFromOutputs(outputs, input, probabilityThreshold),
         durationMs: performance.now() - startedAt
       }
     }

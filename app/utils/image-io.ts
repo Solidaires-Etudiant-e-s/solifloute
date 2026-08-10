@@ -49,7 +49,7 @@ export function imageDataToDetectionInput(imageData: ImageData): DetectionInput 
   }
 }
 
-export function imageDataToObjectUrl(imageData: ImageData) {
+export function imageDataToBlob(imageData: ImageData) {
   const canvas = document.createElement('canvas')
   canvas.width = imageData.width
   canvas.height = imageData.height
@@ -61,14 +61,14 @@ export function imageDataToObjectUrl(imageData: ImageData) {
 
   context.putImageData(imageData, 0, 0)
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (!blob) {
         reject(new Error('Impossible de creer le blob d apercu.'))
         return
       }
 
-      resolve(URL.createObjectURL(blob))
+      resolve(blob)
     }, 'image/png')
   })
 }

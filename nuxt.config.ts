@@ -15,6 +15,9 @@ export default defineNuxtConfig({
   nitro: {
     experimental: {
       wasm: true
+    },
+    externals: {
+      external: ['bun:sqlite']
     }
   },
 

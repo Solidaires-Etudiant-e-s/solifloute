@@ -2,29 +2,14 @@
 
 import type { EditorSettings, Face } from '~~/shared/types/faces'
 import { applyBlurEffects } from '~~/shared/utils/imageProcessing'
+import type { FaceDetectionModelType } from '~~/shared/utils/useFaceDetector'
 import { useFaceDetector } from '~~/shared/utils/useFaceDetector'
-
-interface DetectRequest {
-  type: 'detect'
-  imageData: ImageData
-  threshold: number
-  modelUrl: string
-}
-
-interface ProcessRequest {
-  type: 'process'
-  imageData: ImageData
-  settings: EditorSettings
-  manualFaces?: Face[]
-  modelUrl: string
-}
-
-type WorkerRequest = DetectRequest | ProcessRequest
+import type { DetectSuccess, ProcessSuccess, WorkerErrorResponse, WorkerRequest } from '~/utils/detect-worker'
 
 const messageContext: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope
 
-async function detectFaces(imageData: ImageData, threshold: number, modelUrl: string): Promise<{ faces: Face[], durationMs: number }> {
-  const detector = useFaceDetector(modelUrl)
+async function detectFaces(imageData: ImageData, threshold: number, modelUrl: string, modelType: FaceDetectionModelType): Promise<{ faces: Face[], durationMs: number }> {
+  const detector = useFaceDetector(modelUrl, modelType)
   return await detector.detectFaces({
     data: imageData.data,
     width: imageData.width,
@@ -32,13 +17,12 @@ async function detectFaces(imageData: ImageData, threshold: number, modelUrl: st
   }, threshold)
 }
 
-async function processImage(imageData: ImageData, settings: EditorSettings, modelUrl: string, manualFaces: Face[] = []) {
-  const { faces, durationMs } = await detectFaces(imageData, settings.confidenceThreshold, modelUrl)
-  const allFaces = [...faces, ...manualFaces]
+async function processImage(imageData: ImageData, settings: EditorSettings, modelUrl: string, modelType: FaceDetectionModelType, manualFaces: Face[] = []) {
+  const { faces, durationMs } = await detectFaces(imageData, settings.confidenceThreshold, modelUrl, modelType)
   const processedImageData = new ImageData(
     applyBlurEffects(
       { data: imageData.data, width: imageData.width, height: imageData.height },
-      allFaces,
+      [...faces, ...manualFaces],
       settings.excludedFaceIds,
       settings.blurIntensity
     ),
@@ -47,17 +31,29 @@ async function processImage(imageData: ImageData, settings: EditorSettings, mode
   )
 
   return {
-    faces: allFaces,
+    faces,
     processedImageData,
     durationMs
   }
 }
 
+function respond(response: DetectSuccess | ProcessSuccess | WorkerErrorResponse) {
+  messageContext.postMessage(response)
+}
+
 messageContext.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+  const request = event.data
+  const respondWithId = (payload: Omit<DetectSuccess, 'id'> | Omit<ProcessSuccess, 'id'>) => {
+    respond({
+      id: request.id,
+      ...payload
+    })
+  }
+
   try {
-    if (event.data.type === 'detect') {
-      const result = await detectFaces(event.data.imageData, event.data.threshold, event.data.modelUrl)
-      messageContext.postMessage({
+    if (request.type === 'detect') {
+      const result = await detectFaces(request.imageData, request.threshold, request.modelUrl, request.modelType)
+      respondWithId({
         type: 'detect:success',
         ...result
       })
@@ -65,17 +61,19 @@ messageContext.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     const result = await processImage(
-      event.data.imageData,
-      event.data.settings,
-      event.data.modelUrl,
-      event.data.manualFaces
+      request.imageData,
+      request.settings,
+      request.modelUrl,
+      request.modelType,
+      request.manualFaces
     )
-    messageContext.postMessage({
+    respondWithId({
       type: 'process:success',
       ...result
     })
   } catch (error) {
-    messageContext.postMessage({
+    respond({
+      id: request.id,
       type: 'error',
       message: error instanceof Error ? error.message : 'La requete du worker a echoue.'
     })

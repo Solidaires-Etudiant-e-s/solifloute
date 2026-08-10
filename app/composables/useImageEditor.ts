@@ -1,19 +1,27 @@
 import type { EditorSettings, Face, ProcessingMode } from '~~/shared/types/faces'
 import { applyBlurEffects } from '~~/shared/utils/imageProcessing'
+import { DETECTION_MODELS, getClientModelUrl } from '~~/shared/utils/detectionModels'
 import { useFaceDetector } from '~~/shared/utils/useFaceDetector'
-import { fileToBase64, fileToImageData, imageDataToDetectionInput, imageDataToObjectUrl } from '~/utils/image-io'
+import { fileToBase64, fileToImageData, imageDataToBlob, imageDataToDetectionInput } from '~/utils/image-io'
+import { detectImageData, processImageData } from '~/utils/detect-worker'
 import { inferProcessingTarget } from '~/utils/machine-profile'
-import { processVideoInBrowser } from '~/utils/video-browser'
+import { loadAllEntries, saveEntry, type StoredEntry } from '~/utils/entry-store'
+import {
+  MAX_BROWSER_VIDEO_DURATION_SECONDS,
+  MAX_BROWSER_VIDEO_PIXELS,
+  processVideoInBrowser,
+  readVideoMetadata
+} from '~/utils/video-browser'
 import type { BrowserVideoProgress } from '~/utils/video-browser'
 
-const MODEL_URL = '/models/version-RFB-640.onnx'
+const SETTINGS_STORAGE_KEY = 'solifloute:settings:v2'
 
 const DEFAULT_SETTINGS: EditorSettings = {
   confidenceThreshold: 0.2,
-  detectionIntervalSeconds: 1,
   blurIntensity: 0.5,
   processingMode: 'auto',
-  excludedFaceIds: []
+  excludedFaceIds: [],
+  detectionModel: 'fast'
 }
 
 type EditorStatus = 'idle' | 'detecting' | 'processing' | 'ready' | 'error' | 'cancelled'
@@ -29,10 +37,13 @@ interface UploadEntry {
   faces: Face[]
   status: EditorStatus
   error: string
+  warning: string
   lastDurationMs: number | null
   processingProgress: number | null
   processingMessage: string
+  processingQueued: boolean
   estimatedRemainingMs: number | null
+  serverJobId: string | null
 }
 
 interface DetectResponse {
@@ -40,27 +51,13 @@ interface DetectResponse {
   durationMs: number
 }
 
-interface WorkerDetectSuccess extends DetectResponse {
-  type: 'detect:success'
-}
-
-interface WorkerProcessSuccess {
-  type: 'process:success'
-  faces: Face[]
-  processedImageData: ImageData
-  durationMs: number
-}
-
-interface WorkerError {
-  type: 'error'
-  message: string
-}
-
 interface VideoJobResponse {
   id: string
   status: 'queued' | 'processing' | 'completed' | 'error' | 'cancelled'
   progress: number
+  remainingMs: number | null
   error: string
+  queuePosition: number | null
   downloadUrl: string | null
 }
 
@@ -91,24 +88,89 @@ function isManualFace(face: Face) {
   return face.id.startsWith('manual:')
 }
 
+function loadPersistedSettings(): Partial<EditorSettings> {
+  if (!import.meta.client) {
+    return {}
+  }
+
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY)
+
+    if (!raw) {
+      return {}
+    }
+
+    const parsed = JSON.parse(raw) as Partial<EditorSettings>
+
+    return {
+      confidenceThreshold: typeof parsed.confidenceThreshold === 'number'
+        ? parsed.confidenceThreshold
+        : DEFAULT_SETTINGS.confidenceThreshold,
+      blurIntensity: typeof parsed.blurIntensity === 'number'
+        ? parsed.blurIntensity
+        : DEFAULT_SETTINGS.blurIntensity,
+      processingMode: parsed.processingMode === 'client' || parsed.processingMode === 'server'
+        ? parsed.processingMode
+        : DEFAULT_SETTINGS.processingMode,
+      detectionModel: parsed.detectionModel === 'fast' || parsed.detectionModel === 'advanced'
+        ? parsed.detectionModel
+        : DEFAULT_SETTINGS.detectionModel
+    }
+  } catch {
+    return {}
+  }
+}
+
+function persistSettings(settings: Partial<EditorSettings>) {
+  if (!import.meta.client) {
+    return
+  }
+
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
+      confidenceThreshold: settings.confidenceThreshold,
+      blurIntensity: settings.blurIntensity,
+      processingMode: settings.processingMode,
+      detectionModel: settings.detectionModel
+    }))
+  } catch {
+    // Persisting preferences is best-effort.
+  }
+}
+
 export function useImageEditor() {
-  let videoRunId = 0
-  let detectRunId = 0
+  const entryFiles = new Map<string, File>()
+  const entryImageData = new Map<string, ImageData>()
+  const entryProcessedBlobs = new Map<string, Blob>()
+  const videoRunIds = new Map<string, number>()
+  const detectRunIds = new Map<string, number>()
+  const serverVideoJobIds = new Map<string, string>()
 
   const file = shallowRef<File | null>(null)
   const originalImageData = shallowRef<ImageData | null>(null)
   const uploadEntries = ref<UploadEntry[]>([])
   const currentEntryId = ref<string | null>(null)
-  const settings = reactive<EditorSettings>({ ...DEFAULT_SETTINGS })
+  const settings = reactive<EditorSettings>({ ...DEFAULT_SETTINGS, ...loadPersistedSettings() })
   const autoResolvedMode = ref<Exclude<ProcessingMode, 'auto'>>('client')
-  const processingStartedAt = ref<number | null>(null)
-  const currentServerVideoJobId = ref<string | null>(null)
+  const videoServerOnly = ref(false)
   const safariVideoModalOpen = ref(false)
   const isSafari = isSafariBrowser()
-  const clientDetector = import.meta.client ? useFaceDetector(MODEL_URL) : null
-  const worker = import.meta.client
-    ? new Worker(new URL('../workers/imageProcessor.worker.ts', import.meta.url), { type: 'module' })
-    : null
+  const clientDetector = shallowRef<ReturnType<typeof useFaceDetector> | null>(null)
+
+  function getClientDetector() {
+    if (!import.meta.client) {
+      return null
+    }
+
+    if (!clientDetector.value) {
+      clientDetector.value = useFaceDetector(
+        getClientModelUrl(settings.detectionModel),
+        DETECTION_MODELS[settings.detectionModel].modelType
+      )
+    }
+
+    return clientDetector.value
+  }
 
   const currentEntry = computed(() => (
     currentEntryId.value
@@ -121,8 +183,12 @@ export function useImageEditor() {
     && mediaKind.value === 'video'
   ))
 
+  const serverOnly = computed(() => (
+    isSafariVideoForcedToServer.value || videoServerOnly.value
+  ))
+
   const activeMode = computed(() => {
-    if (isSafariVideoForcedToServer.value) {
+    if (serverOnly.value) {
       return 'server'
     }
 
@@ -146,100 +212,165 @@ export function useImageEditor() {
     }
   }
 
-  function revokeEntryUrls(entry: UploadEntry) {
-    revokeUrl(entry.originalPreviewUrl)
-    revokeUrl(entry.processedPreviewUrl)
+  function nextRunId(map: Map<string, number>, entryId: string) {
+    const next = (map.get(entryId) || 0) + 1
+    map.set(entryId, next)
+    return next
   }
 
-  function revokeAllEntryUrls() {
-    for (const entry of uploadEntries.value) {
-      revokeEntryUrls(entry)
+  function currentRunId(map: Map<string, number>, entryId: string) {
+    return map.get(entryId) || 0
+  }
+
+  function updateEntry(entryId: string, patch: Partial<UploadEntry>) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (entry) {
+      Object.assign(entry, patch)
     }
   }
 
   function updateCurrentEntry(patch: Partial<UploadEntry>) {
-    if (!currentEntry.value) {
-      return
+    if (currentEntryId.value) {
+      updateEntry(currentEntryId.value, patch)
     }
-
-    Object.assign(currentEntry.value, patch)
   }
 
-  function setStatus(nextStatus: EditorStatus, nextError = '') {
-    updateCurrentEntry({
+  function setEntryStatus(entryId: string, nextStatus: EditorStatus, nextError = '') {
+    updateEntry(entryId, {
       status: nextStatus,
       error: nextError
     })
+    void persistEntry(entryId)
   }
 
-  function updateProgress(progress: number | BrowserVideoProgress | null, message = '') {
+  function setStatus(nextStatus: EditorStatus, nextError = '') {
+    if (currentEntryId.value) {
+      setEntryStatus(currentEntryId.value, nextStatus, nextError)
+    }
+  }
+
+  async function persistEntry(entryId: string) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+    const entryFile = entryFiles.get(entryId)
+
+    if (!entry || !entryFile) {
+      return
+    }
+
+    const stored: StoredEntry = {
+      id: entry.id,
+      createdAt: entry.createdAt,
+      fileName: entry.fileName,
+      mediaKind: entry.mediaKind,
+      faces: entry.faces.map(face => ({ ...face })),
+      status: entry.status,
+      error: entry.error,
+      warning: entry.warning,
+      lastDurationMs: entry.lastDurationMs,
+      serverJobId: entry.serverJobId,
+      originalBlob: entryFile,
+      processedBlob: entryProcessedBlobs.get(entryId) ?? null
+    }
+
+    try {
+      await saveEntry(stored)
+      console.info('[solifloute] entree persistee', entry.fileName, entry.status)
+    } catch (cause) {
+      console.error('[solifloute] echec de persistance', entry.fileName, cause)
+    }
+  }
+
+  function updateProgress(
+    entryId: string,
+    progress: number | BrowserVideoProgress | null,
+    message = '',
+    remainingMs: number | null = null
+  ) {
     const progressValue = progress && typeof progress === 'object' ? progress.progress : progress
     const nextMessage = progress && typeof progress === 'object' ? progress.message : message
+    const sourceRemainingMs = progress && typeof progress === 'object' ? progress.remainingMs : remainingMs
     const shouldEstimate = !nextMessage.includes('dependances navigateur')
       && !nextMessage.includes('FFmpeg WebAssembly')
       && !nextMessage.includes('FFmpeg navigateur')
       && !nextMessage.includes('modele IA')
     const normalizedProgress = clampProgress(progressValue)
-    const startedAt = processingStartedAt.value
-    const remainingMs = (
-      startedAt
-      && normalizedProgress !== null
-      && normalizedProgress > 0
-      && normalizedProgress < 1
-      && normalizedProgress >= 0.16
-      && shouldEstimate
-    )
-      ? Math.max(0, ((Date.now() - startedAt) / normalizedProgress) - (Date.now() - startedAt))
+    const estimatedRemainingMs = shouldEstimate && sourceRemainingMs !== null
+      ? Math.max(0, sourceRemainingMs)
       : null
 
-    updateCurrentEntry({
+    updateEntry(entryId, {
       processingProgress: normalizedProgress,
       processingMessage: normalizedProgress === null ? '' : nextMessage,
-      estimatedRemainingMs: remainingMs
+      estimatedRemainingMs
     })
   }
 
-  function getCurrentManualFaces() {
-    return currentEntry.value?.faces.filter(isManualFace) ?? []
+  function getManualFaces(entryId: string) {
+    return uploadEntries.value.find(entry => entry.id === entryId)?.faces.filter(isManualFace) ?? []
   }
 
-  function applyDetection(result: DetectResponse) {
-    updateCurrentEntry({
-      faces: [...result.faces, ...getCurrentManualFaces()],
+  function applyDetection(entryId: string, result: DetectResponse) {
+    updateEntry(entryId, {
+      faces: [...result.faces, ...getManualFaces(entryId)],
       lastDurationMs: result.durationMs
     })
+    void persistEntry(entryId)
   }
 
   function createSettingsSnapshot(): EditorSettings {
     return {
       confidenceThreshold: settings.confidenceThreshold,
-      detectionIntervalSeconds: settings.detectionIntervalSeconds,
       blurIntensity: settings.blurIntensity,
       processingMode: settings.processingMode,
-      excludedFaceIds: [...settings.excludedFaceIds]
+      excludedFaceIds: [...settings.excludedFaceIds],
+      detectionModel: settings.detectionModel
     }
   }
 
-  async function setProcessedPreview(url: string) {
-    if (!currentEntry.value) {
-      revokeUrl(url)
+  async function setProcessedPreview(entryId: string, blob: Blob) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entry) {
       return
     }
 
-    revokeUrl(currentEntry.value.processedPreviewUrl)
-    updateCurrentEntry({ processedPreviewUrl: url })
+    revokeUrl(entry.processedPreviewUrl)
+    entryProcessedBlobs.set(entryId, blob)
+    updateEntry(entryId, { processedPreviewUrl: URL.createObjectURL(blob) })
+    await persistEntry(entryId)
   }
 
-  async function refreshClientPreview(nextFaces = faces.value) {
-    if (!originalImageData.value) {
+  async function getEntryImageData(entryId: string) {
+    let imageData = entryImageData.get(entryId)
+
+    if (!imageData) {
+      const entryFile = entryFiles.get(entryId)
+
+      if (!entryFile) {
+        return null
+      }
+
+      imageData = await fileToImageData(entryFile)
+      entryImageData.set(entryId, imageData)
+    }
+
+    return imageData
+  }
+
+  async function refreshClientPreviewForEntry(entryId: string, nextFaces: Face[] = []) {
+    const imageData = await getEntryImageData(entryId)
+
+    if (!imageData) {
       return
     }
 
-    const imageData = originalImageData.value
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+    const facesToBlur = nextFaces.length > 0 ? nextFaces : (entry?.faces ?? [])
     const processedImageData = new ImageData(
       applyBlurEffects(
         imageDataToDetectionInput(imageData),
-        nextFaces,
+        facesToBlur,
         settings.excludedFaceIds,
         settings.blurIntensity
       ),
@@ -247,56 +378,60 @@ export function useImageEditor() {
       imageData.height
     )
 
-    await setProcessedPreview(await imageDataToObjectUrl(processedImageData))
+    await setProcessedPreview(entryId, await imageDataToBlob(processedImageData))
   }
 
-  async function detectOnClient() {
-    if (!originalImageData.value || !clientDetector) {
+  async function refreshClientPreview(nextFaces = faces.value) {
+    const entryId = currentEntryId.value
+
+    if (!entryId) {
+      return
+    }
+
+    await refreshClientPreviewForEntry(entryId, nextFaces)
+  }
+
+  async function detectOnClientForEntry(entryId: string) {
+    const imageData = await getEntryImageData(entryId)
+    const detector = getClientDetector()
+
+    if (!imageData || !detector) {
       throw new Error('La detection des visages dans le navigateur est indisponible.')
     }
 
-    return await clientDetector.detectFaces(
-      imageDataToDetectionInput(originalImageData.value),
+    return await detector.detectFaces(
+      imageDataToDetectionInput(imageData),
       settings.confidenceThreshold
     )
   }
 
-  async function detectInWorker() {
-    if (!worker || !originalImageData.value) {
-      return await detectOnClient()
+  async function detectInWorkerForEntry(entryId: string) {
+    const imageData = await getEntryImageData(entryId)
+
+    if (!imageData) {
+      throw new Error('Aucune image n a ete chargee.')
     }
 
-    return await new Promise<DetectResponse>((resolve, reject) => {
-      const handleMessage = (event: MessageEvent<WorkerDetectSuccess | WorkerError>) => {
-        if (event.data.type === 'error') {
-          worker.removeEventListener('message', handleMessage)
-          reject(new Error(event.data.message))
-          return
-        }
-
-        if (event.data.type !== 'detect:success') {
-          return
-        }
-
-        worker.removeEventListener('message', handleMessage)
-        resolve({
-          faces: event.data.faces,
-          durationMs: event.data.durationMs
-        })
+    try {
+      const result = await detectImageData(
+        imageData,
+        settings.confidenceThreshold,
+        getClientModelUrl(settings.detectionModel),
+        DETECTION_MODELS[settings.detectionModel].modelType
+      )
+      return {
+        faces: result.faces,
+        durationMs: result.durationMs
       }
-
-      worker.addEventListener('message', handleMessage)
-      worker.postMessage({
-        type: 'detect',
-        imageData: originalImageData.value,
-        threshold: settings.confidenceThreshold,
-        modelUrl: MODEL_URL
-      })
-    })
+    } catch {
+      return await detectOnClientForEntry(entryId)
+    }
   }
 
-  async function detectOnServer() {
-    if (!file.value) {
+  async function detectOnServerForEntry(entryId: string) {
+    const entryFile = entryFiles.get(entryId)
+
+    if (!entryFile) {
       throw new Error('Aucune image n a ete chargee.')
     }
 
@@ -304,97 +439,95 @@ export function useImageEditor() {
       method: 'POST',
       body: {
         action: 'detect',
-        imageBase64: await fileToBase64(file.value),
-        fileName: file.value.name,
-        mimeType: file.value.type,
+        imageBase64: await fileToBase64(entryFile),
+        fileName: entryFile.name,
+        mimeType: entryFile.type,
         settings: createSettingsSnapshot()
       }
     })
   }
 
-  async function detectFaces() {
-    if (mediaKind.value !== 'image' || !originalImageData.value || !currentEntry.value) {
+  async function detectFacesForEntry(entryId: string) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entry || entry.mediaKind !== 'image' || !entryImageData.has(entryId)) {
       return
     }
 
-    const runId = ++detectRunId
-    setStatus('detecting')
+    const runId = nextRunId(detectRunIds, entryId)
+    setEntryStatus(entryId, 'detecting')
 
     try {
       const result = activeMode.value === 'server'
-        ? await detectOnServer()
-        : await detectInWorker()
+        ? await detectOnServerForEntry(entryId)
+        : await detectInWorkerForEntry(entryId)
 
-      if (runId !== detectRunId || !currentEntry.value) {
+      if (currentRunId(detectRunIds, entryId) !== runId) {
         return
       }
 
-      applyDetection(result)
+      applyDetection(entryId, result)
 
       if (activeMode.value === 'client') {
-        await refreshClientPreview(result.faces)
+        await refreshClientPreviewForEntry(entryId)
       }
 
-      setStatus('ready')
+      setEntryStatus(entryId, 'ready')
     } catch (cause) {
-      if (runId !== detectRunId) {
+      if (currentRunId(detectRunIds, entryId) !== runId) {
         return
       }
 
-      setStatus(
+      setEntryStatus(
+        entryId,
         'error',
         cause instanceof Error ? cause.message : 'La detection des visages a echoue.'
       )
     }
   }
 
-  async function processOnClient() {
-    const result = await detectOnClient()
-    applyDetection(result)
-    await refreshClientPreview(result.faces)
+  function detectFaces() {
+    if (currentEntryId.value) {
+      return detectFacesForEntry(currentEntryId.value)
+    }
   }
 
-  async function processInWorker() {
-    if (!worker || !originalImageData.value) {
-      await processOnClient()
-      return
+  async function processOnClientForEntry(entryId: string) {
+    const result = await detectOnClientForEntry(entryId)
+    applyDetection(entryId, result)
+    await refreshClientPreviewForEntry(entryId)
+  }
+
+  async function processInWorkerForEntry(entryId: string) {
+    const imageData = await getEntryImageData(entryId)
+
+    if (!imageData) {
+      throw new Error('Aucune image n a ete chargee.')
     }
 
-    const response = await new Promise<WorkerProcessSuccess>((resolve, reject) => {
-      const handleMessage = (event: MessageEvent<WorkerProcessSuccess | WorkerError>) => {
-        if (event.data.type === 'error') {
-          worker.removeEventListener('message', handleMessage)
-          reject(new Error(event.data.message))
-          return
-        }
+    try {
+      const response = await processImageData(
+        imageData,
+        createSettingsSnapshot(),
+        getManualFaces(entryId),
+        getClientModelUrl(settings.detectionModel),
+        DETECTION_MODELS[settings.detectionModel].modelType
+      )
 
-        if (event.data.type !== 'process:success') {
-          return
-        }
-
-        worker.removeEventListener('message', handleMessage)
-        resolve(event.data)
-      }
-
-      worker.addEventListener('message', handleMessage)
-      worker.postMessage({
-        type: 'process',
-        imageData: originalImageData.value,
-        settings: createSettingsSnapshot(),
-        manualFaces: getCurrentManualFaces(),
-        modelUrl: MODEL_URL
+      applyDetection(entryId, {
+        faces: response.faces,
+        durationMs: response.durationMs
       })
-    })
-
-    applyDetection({
-      faces: response.faces,
-      durationMs: response.durationMs
-    })
-    await setProcessedPreview(await imageDataToObjectUrl(response.processedImageData))
+      await setProcessedPreview(entryId, await imageDataToBlob(response.processedImageData))
+    } catch {
+      await processOnClientForEntry(entryId)
+    }
   }
 
-  async function processOnServer() {
-    if (!file.value) {
+  async function processOnServerForEntry(entryId: string) {
+    const entryFile = entryFiles.get(entryId)
+
+    if (!entryFile) {
       throw new Error('Aucune image n a ete chargee.')
     }
 
@@ -402,11 +535,11 @@ export function useImageEditor() {
       method: 'POST',
       body: {
         action: 'process',
-        imageBase64: await fileToBase64(file.value),
-        fileName: file.value.name,
-        mimeType: file.value.type,
+        imageBase64: await fileToBase64(entryFile),
+        fileName: entryFile.name,
+        mimeType: entryFile.type,
         settings: createSettingsSnapshot(),
-        manualFaces: getCurrentManualFaces()
+        manualFaces: getManualFaces(entryId)
       },
       responseType: 'blob'
     })
@@ -415,66 +548,68 @@ export function useImageEditor() {
       throw new Error('Le serveur n a pas renvoye de blob image.')
     }
 
-    await setProcessedPreview(URL.createObjectURL(response._data))
+    await setProcessedPreview(entryId, response._data)
   }
 
-  async function processVideo() {
-    if (!file.value || !currentEntry.value) {
+  async function pollServerVideoJob(entryId: string, jobId: string, runId: number) {
+    while (runId === currentRunId(videoRunIds, entryId)) {
+      const job = await $fetch<VideoJobResponse>(`/api/process-jobs/${jobId}`)
+
+      if (job.status === 'queued') {
+        updateEntry(entryId, {
+          processingProgress: 0,
+          processingMessage: job.queuePosition !== null
+            ? `Video en attente dans la file (position ${job.queuePosition}).`
+            : 'Video en attente dans la file.',
+          estimatedRemainingMs: null,
+          processingQueued: true
+        })
+      } else if (job.status === 'processing') {
+        updateEntry(entryId, { processingQueued: false })
+        updateProgress(entryId, job.progress, 'Traitement video sur le serveur.', job.remainingMs)
+      }
+
+      if (job.status === 'completed') {
+        const downloadUrl = job.downloadUrl || `/api/process-jobs/${jobId}/download`
+        const response = await $fetch.raw(downloadUrl, { responseType: 'blob' })
+
+        if (!(response._data instanceof Blob)) {
+          throw new Error('Le serveur n a pas renvoye de blob video.')
+        }
+
+        return response._data
+      }
+
+      if (job.status === 'error') {
+        throw new Error(job.error || 'Le traitement de la video a echoue.')
+      }
+
+      if (job.status === 'cancelled') {
+        throw new Error(job.error || 'Traitement annule.')
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+
+    return null
+  }
+
+  async function resumeServerVideoJob(entryId: string, jobId: string) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entry) {
       return
     }
 
-    const runId = ++videoRunId
-    const startedAt = Date.now()
-    processingStartedAt.value = startedAt
-    setStatus('processing')
-    updateProgress(0, 'Preparation du traitement video.')
+    const runId = nextRunId(videoRunIds, entryId)
+    serverVideoJobIds.set(entryId, jobId)
+    setEntryStatus(entryId, 'processing')
+    updateProgress(entryId, 0, 'Reprise du traitement video sur le serveur.')
 
     try {
-      let blob: Blob | null = null
+      const blob = await pollServerVideoJob(entryId, jobId, runId)
 
-      if (activeMode.value === 'server') {
-        const body = new FormData()
-        body.append('file', file.value)
-        body.append('settings', JSON.stringify(createSettingsSnapshot()))
-
-        const { jobId } = await $fetch<{ jobId: string }>('/api/process-video', {
-          method: 'POST',
-          body
-        })
-        currentServerVideoJobId.value = jobId
-
-        while (runId === videoRunId) {
-          const job = await $fetch<VideoJobResponse>(`/api/process-jobs/${jobId}`)
-
-          updateProgress(job.progress, 'Traitement video sur le serveur.')
-
-          if (job.status === 'completed') {
-            const downloadUrl = job.downloadUrl || `/api/process-jobs/${jobId}/download`
-            const response = await $fetch.raw(downloadUrl, { responseType: 'blob' })
-
-            if (!(response._data instanceof Blob)) {
-              throw new Error('Le serveur n a pas renvoye de blob video.')
-            }
-
-            blob = response._data
-            break
-          }
-
-          if (job.status === 'error') {
-            throw new Error(job.error || 'Le traitement de la video a echoue.')
-          }
-
-          if (job.status === 'cancelled') {
-            throw new Error(job.error || 'Traitement annule.')
-          }
-
-          await new Promise(resolve => setTimeout(resolve, 500))
-        }
-      } else {
-        blob = await processVideoInBrowser(file.value, createSettingsSnapshot(), updateProgress)
-      }
-
-      if (runId !== videoRunId) {
+      if (runId !== currentRunId(videoRunIds, entryId)) {
         return
       }
 
@@ -482,36 +617,107 @@ export function useImageEditor() {
         throw new Error('Aucun resultat video n a ete produit.')
       }
 
-      await setProcessedPreview(URL.createObjectURL(blob))
-      updateCurrentEntry({
-        lastDurationMs: Date.now() - startedAt
-      })
-      setStatus('ready')
+      await setProcessedPreview(entryId, blob)
+      setEntryStatus(entryId, 'ready')
     } catch (cause) {
-      if (runId !== videoRunId) {
+      if (runId !== currentRunId(videoRunIds, entryId)) {
         return
       }
 
-      setStatus(
+      setEntryStatus(
+        entryId,
         'error',
         cause instanceof Error ? cause.message : 'Le traitement de la video a echoue.'
       )
     } finally {
-      if (runId === videoRunId) {
-        processingStartedAt.value = null
-        currentServerVideoJobId.value = null
-        updateProgress(null)
+      updateEntry(entryId, { serverJobId: null })
+      void persistEntry(entryId)
+
+      if (runId === currentRunId(videoRunIds, entryId)) {
+        serverVideoJobIds.delete(entryId)
+        updateEntry(entryId, { processingQueued: false })
+        updateProgress(entryId, null)
       }
     }
   }
 
-  async function cancelVideoProcessing() {
-    videoRunId += 1
-    const jobId = currentServerVideoJobId.value
-    currentServerVideoJobId.value = null
-    processingStartedAt.value = null
-    updateProgress(null)
-    setStatus('cancelled', 'Traitement annule.')
+  async function processVideoForEntry(entryId: string) {
+    const entryFile = entryFiles.get(entryId)
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entryFile || !entry) {
+      return
+    }
+
+    const runId = nextRunId(videoRunIds, entryId)
+    const startedAt = Date.now()
+    setEntryStatus(entryId, 'processing')
+    updateProgress(entryId, 0, 'Preparation du traitement video.')
+
+    try {
+      let blob: Blob | null = null
+
+      if (activeMode.value === 'server') {
+        const body = new FormData()
+        body.append('file', entryFile)
+        body.append('settings', JSON.stringify(createSettingsSnapshot()))
+
+        const { jobId } = await $fetch<{ jobId: string }>('/api/process-video', {
+          method: 'POST',
+          body
+        })
+        serverVideoJobIds.set(entryId, jobId)
+        updateEntry(entryId, { serverJobId: jobId })
+        void persistEntry(entryId)
+        blob = await pollServerVideoJob(entryId, jobId, runId)
+      } else {
+        blob = await processVideoInBrowser(entryFile, createSettingsSnapshot(), (progress) => {
+          updateProgress(entryId, progress)
+        })
+      }
+
+      if (runId !== currentRunId(videoRunIds, entryId)) {
+        return
+      }
+
+      if (!blob) {
+        throw new Error('Aucun resultat video n a ete produit.')
+      }
+
+      await setProcessedPreview(entryId, blob)
+      updateEntry(entryId, {
+        lastDurationMs: Date.now() - startedAt
+      })
+      setEntryStatus(entryId, 'ready')
+    } catch (cause) {
+      if (runId !== currentRunId(videoRunIds, entryId)) {
+        return
+      }
+
+      setEntryStatus(
+        entryId,
+        'error',
+        cause instanceof Error ? cause.message : 'Le traitement de la video a echoue.'
+      )
+    } finally {
+      updateEntry(entryId, { serverJobId: null })
+      void persistEntry(entryId)
+
+      if (runId === currentRunId(videoRunIds, entryId)) {
+        serverVideoJobIds.delete(entryId)
+        updateEntry(entryId, { processingQueued: false })
+        updateProgress(entryId, null)
+      }
+    }
+  }
+
+  async function cancelEntryProcessing(entryId: string) {
+    nextRunId(videoRunIds, entryId)
+    const jobId = serverVideoJobIds.get(entryId)
+    serverVideoJobIds.delete(entryId)
+    updateEntry(entryId, { processingQueued: false, serverJobId: null })
+    updateProgress(entryId, null)
+    setEntryStatus(entryId, 'cancelled', 'Traitement annule.')
 
     if (!jobId) {
       return
@@ -526,48 +732,62 @@ export function useImageEditor() {
     }
   }
 
-  async function processImage() {
-    if (!file.value || !currentEntry.value) {
+  async function processEntry(entryId: string) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entry) {
       return
     }
 
-    if (mediaKind.value === 'video') {
-      await processVideo()
+    if (entry.processedPreviewUrl) {
+      revokeUrl(entry.processedPreviewUrl)
+      entryProcessedBlobs.delete(entryId)
+      updateEntry(entryId, { processedPreviewUrl: '' })
+    }
+
+    if (entry.mediaKind === 'video') {
+      await processVideoForEntry(entryId)
       return
     }
 
-    setStatus('processing')
+    setEntryStatus(entryId, 'processing')
 
     try {
       if (activeMode.value === 'server') {
-        await processOnServer()
+        await processOnServerForEntry(entryId)
       } else {
-        await processInWorker()
+        await processInWorkerForEntry(entryId)
       }
 
-      setStatus('ready')
+      setEntryStatus(entryId, 'ready')
     } catch (cause) {
-      setStatus(
+      setEntryStatus(
+        entryId,
         'error',
         cause instanceof Error ? cause.message : 'Le traitement de l image a echoue.'
       )
     }
   }
 
-  async function loadFile(nextFile: File) {
-    if (status.value === 'processing') {
-      await cancelVideoProcessing()
+  async function retryEntry(entryId: string) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entry || entry.status === 'processing') {
+      return
     }
 
-    videoRunId += 1
-    detectRunId += 1
+    await processEntry(entryId)
+  }
+
+  async function loadFile(nextFile: File) {
     file.value = nextFile
     originalImageData.value = null
     settings.excludedFaceIds = []
-    processingStartedAt.value = null
+    videoServerOnly.value = false
 
     const mediaKind = nextFile.type.startsWith('video/') ? 'video' : 'image'
     const entryId = crypto.randomUUID()
+    entryFiles.set(entryId, nextFile)
     currentEntryId.value = entryId
     uploadEntries.value.unshift({
       id: entryId,
@@ -579,11 +799,15 @@ export function useImageEditor() {
       faces: [],
       status: mediaKind === 'video' ? 'ready' : 'detecting',
       error: '',
+      warning: '',
       lastDurationMs: null,
       processingProgress: null,
       processingMessage: '',
-      estimatedRemainingMs: null
+      processingQueued: false,
+      estimatedRemainingMs: null,
+      serverJobId: null
     })
+    void persistEntry(entryId)
 
     const inferredMode = await inferProcessingTarget(nextFile.size)
     autoResolvedMode.value = mediaKind === 'video' && (nextFile.size > 12 * 1024 * 1024 || inferredMode !== 'client')
@@ -592,29 +816,57 @@ export function useImageEditor() {
     safariVideoModalOpen.value = mediaKind === 'video' && isSafari
 
     if (mediaKind === 'video') {
+      await checkVideoCompatibility(nextFile)
+      void persistEntry(entryId)
       return entryId
     }
 
-    originalImageData.value = await fileToImageData(nextFile)
-    await detectFaces()
+    const imageData = await fileToImageData(nextFile)
+    entryImageData.set(entryId, imageData)
+    originalImageData.value = imageData
+    await detectFacesForEntry(entryId)
+    void persistEntry(entryId)
 
     return entryId
   }
 
-  function clear() {
-    if (status.value === 'processing') {
-      void cancelVideoProcessing()
+  async function checkVideoCompatibility(nextFile: File) {
+    if (!import.meta.client || !currentEntry.value) {
+      return
     }
 
-    videoRunId += 1
-    detectRunId += 1
-    file.value = null
-    originalImageData.value = null
-    settings.excludedFaceIds = []
-    processingStartedAt.value = null
-    currentEntryId.value = null
-    revokeAllEntryUrls()
-    uploadEntries.value = []
+    const metadata = await readVideoMetadata(nextFile).catch(() => null)
+
+    if (!metadata) {
+      return
+    }
+
+    const browserCannotDecode = metadata.width <= 0 || metadata.height <= 0
+
+    if (browserCannotDecode) {
+      console.info('[solifloute] le navigateur ne peut pas decoder la video', {
+        fileName: nextFile.name,
+        width: metadata.width,
+        height: metadata.height,
+        duration: metadata.duration
+      })
+      videoServerOnly.value = true
+      autoResolvedMode.value = 'server'
+
+      return
+    }
+
+    const tooLong = metadata.duration > MAX_BROWSER_VIDEO_DURATION_SECONDS
+    const tooBig = metadata.width * metadata.height > MAX_BROWSER_VIDEO_PIXELS
+
+    if (tooLong || tooBig) {
+      videoServerOnly.value = true
+      autoResolvedMode.value = 'server'
+
+      updateCurrentEntry({
+        warning: 'Cette video depasse les limites du traitement navigateur. Le mode serveur est force.'
+      })
+    }
   }
 
   function toggleExcludedFace(faceId: string) {
@@ -655,7 +907,123 @@ export function useImageEditor() {
     safariVideoModalOpen.value = false
   }
 
+  async function restoreEntries() {
+    if (!import.meta.client || uploadEntries.value.length > 0) {
+      return
+    }
+
+    let stored: StoredEntry[]
+
+    try {
+      stored = await loadAllEntries()
+      console.info('[solifloute] restauration: ' + stored.length + ' entree(s) trouvee(s)')
+    } catch (cause) {
+      console.error('[solifloute] echec de lecture de la base', cause)
+      return
+    }
+
+    if (stored.length === 0) {
+      return
+    }
+
+    stored.sort((left, right) => right.createdAt - left.createdAt)
+
+    const restored: UploadEntry[] = []
+    const pendingResumes: Array<{ entryId: string, jobId: string }> = []
+
+    for (const item of stored) {
+      const entryFile = new File([item.originalBlob], item.fileName, {
+        type: item.originalBlob.type || undefined
+      })
+      entryFiles.set(item.id, entryFile)
+
+      if (item.processedBlob) {
+        entryProcessedBlobs.set(item.id, item.processedBlob)
+      }
+
+      const serverJobId = item.serverJobId ?? null
+      const inFlight = (
+        item.status === 'processing'
+        || item.status === 'queued'
+        || item.status === 'detecting'
+      )
+      const status: EditorStatus = inFlight && !item.processedBlob
+        ? (serverJobId ? 'processing' : 'error')
+        : (item.status as EditorStatus)
+
+      if (serverJobId && !item.processedBlob && (item.status === 'processing' || item.status === 'queued')) {
+        pendingResumes.push({ entryId: item.id, jobId: serverJobId })
+      }
+
+      restored.push({
+        id: item.id,
+        createdAt: item.createdAt,
+        fileName: item.fileName,
+        mediaKind: item.mediaKind,
+        originalPreviewUrl: URL.createObjectURL(entryFile),
+        processedPreviewUrl: item.processedBlob ? URL.createObjectURL(item.processedBlob) : '',
+        faces: item.faces,
+        status,
+        error: inFlight && status === 'error' && !serverJobId
+          ? 'Le traitement a ete interrompu. Relancez-le.'
+          : item.error,
+        warning: item.warning,
+        lastDurationMs: item.lastDurationMs,
+        processingProgress: null,
+        processingMessage: '',
+        processingQueued: false,
+        estimatedRemainingMs: null,
+        serverJobId
+      })
+    }
+
+    uploadEntries.value = restored
+    const mostRecent = restored[0]
+
+    if (mostRecent) {
+      currentEntryId.value = mostRecent.id
+      file.value = entryFiles.get(mostRecent.id) ?? null
+
+      if (mostRecent.mediaKind === 'image') {
+        originalImageData.value = await getEntryImageData(mostRecent.id)
+      }
+    }
+
+    for (const pending of pendingResumes) {
+      void resumeServerVideoJob(pending.entryId, pending.jobId)
+    }
+  }
+
+  if (import.meta.client) {
+    onMounted(() => {
+      void restoreEntries()
+    })
+
+    const debugApi = {
+      restore: () => restoreEntries(),
+      entries: () => uploadEntries.value,
+      db: () => loadAllEntries()
+    }
+
+    Object.assign(window, { __solifloute: debugApi })
+  }
+
   watch(() => settings.confidenceThreshold, async () => {
+    if (mediaKind.value === 'image' && file.value && originalImageData.value) {
+      await detectFaces()
+    }
+  })
+
+  watch(() => settings.detectionModel, async () => {
+    if (!import.meta.client) {
+      return
+    }
+
+    clientDetector.value = useFaceDetector(
+      getClientModelUrl(settings.detectionModel),
+      DETECTION_MODELS[settings.detectionModel].modelType
+    )
+
     if (mediaKind.value === 'image' && file.value && originalImageData.value) {
       await detectFaces()
     }
@@ -694,10 +1062,22 @@ export function useImageEditor() {
     }
   )
 
-  onScopeDispose(() => {
-    revokeAllEntryUrls()
-    worker?.terminate()
+  watch(serverOnly, (forced) => {
+    if (forced) {
+      settings.processingMode = 'server'
+    }
   })
+
+  watch(
+    () => ({
+      confidenceThreshold: settings.confidenceThreshold,
+      blurIntensity: settings.blurIntensity,
+      processingMode: settings.processingMode
+    }),
+    (value) => {
+      persistSettings(value)
+    }
+  )
 
   return {
     file,
@@ -709,6 +1089,7 @@ export function useImageEditor() {
     error,
     settings,
     activeMode,
+    serverOnly,
     originalPreviewUrl,
     processedPreviewUrl,
     processingProgress,
@@ -718,10 +1099,10 @@ export function useImageEditor() {
     safariVideoModalOpen,
     isSafariVideoForcedToServer,
     loadFile,
-    clear,
     detectFaces,
-    processImage,
-    cancelVideoProcessing,
+    processEntry,
+    retryEntry,
+    cancelEntryProcessing,
     toggleExcludedFace,
     addManualFace,
     closeSafariVideoModal

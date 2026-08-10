@@ -1,8 +1,7 @@
 import type { Face } from '../types/faces'
 
+const MASK_SCALE = 1.3
 const MIN_BLUR_RADIUS = 2
-const MAX_BLUR_RADIUS = 22
-const MAX_BOOSTED_BLUR_RADIUS = MAX_BLUR_RADIUS * 2
 
 interface RasterImage {
   data: Uint8ClampedArray
@@ -36,7 +35,20 @@ function ensureScratch(scratch: BlurScratch, length: number) {
   scratch.target = ensureBuffer(scratch.target, length)
 }
 
-function createMaskChecker(face: Face) {
+function scaleFaceAroundCenter(face: Face, scale: number): Face {
+  const width = Math.max(1, Math.round(face.width * scale))
+  const height = Math.max(1, Math.round(face.height * scale))
+
+  return {
+    ...face,
+    x: Math.round(face.x - ((width - face.width) / 2)),
+    y: Math.round(face.y - ((height - face.height) / 2)),
+    width,
+    height
+  }
+}
+
+function createEllipseAlpha(face: Face) {
   const centerX = face.x + (face.width / 2)
   const centerY = face.y + (face.height / 2)
   const radiusX = Math.max(1, face.width / 2)
@@ -46,7 +58,7 @@ function createMaskChecker(face: Face) {
     const dx = (x + 0.5 - centerX) / radiusX
     const dy = (y + 0.5 - centerY) / radiusY
 
-    return (dx * dx) + (dy * dy) <= 1
+    return Math.hypot(dx, dy) <= 1 ? 1 : 0
   }
 }
 
@@ -72,58 +84,6 @@ function extractRegion(image: RasterImage, face: Face, padding: number) {
   }
 
   return { left, top, width, height, data }
-}
-
-function averageBlock(data: Uint8ClampedArray, width: number, startX: number, startY: number, endX: number, endY: number): [number, number, number, number] {
-  let red = 0
-  let green = 0
-  let blue = 0
-  let alpha = 0
-  let count = 0
-
-  for (let y = startY; y < endY; y += 1) {
-    for (let x = startX; x < endX; x += 1) {
-      const index = getPixelIndex(x, y, width)
-      red += readByte(data, index)
-      green += readByte(data, index + 1)
-      blue += readByte(data, index + 2)
-      alpha += readByte(data, index + 3)
-      count += 1
-    }
-  }
-
-  return [
-    Math.round(red / count),
-    Math.round(green / count),
-    Math.round(blue / count),
-    Math.round(alpha / count)
-  ]
-}
-
-function pixelateRegion(region: RasterImage, blockSize: number, scratch: BlurScratch) {
-  ensureScratch(scratch, region.data.length)
-  const output = scratch.target
-  output.set(region.data)
-
-  for (let y = 0; y < region.height; y += blockSize) {
-    for (let x = 0; x < region.width; x += blockSize) {
-      const endX = Math.min(region.width, x + blockSize)
-      const endY = Math.min(region.height, y + blockSize)
-      const [red, green, blue, alpha] = averageBlock(region.data, region.width, x, y, endX, endY)
-
-      for (let fillY = y; fillY < endY; fillY += 1) {
-        for (let fillX = x; fillX < endX; fillX += 1) {
-          const index = getPixelIndex(fillX, fillY, region.width)
-          output[index] = red
-          output[index + 1] = green
-          output[index + 2] = blue
-          output[index + 3] = alpha
-        }
-      }
-    }
-  }
-
-  return output
 }
 
 function boxBlurHorizontal(input: Uint8ClampedArray, output: Uint8ClampedArray, width: number, height: number, radius: number) {
@@ -202,41 +162,27 @@ function boxBlurVertical(input: Uint8ClampedArray, output: Uint8ClampedArray, wi
   }
 }
 
-function gaussianApproximation(region: RasterImage, radius: number, scratch: BlurScratch) {
-  if (radius <= 1) {
-    return new Uint8ClampedArray(region.data)
+function boxBlurRegion(region: RasterImage, radiusX: number, radiusY: number, scratch: BlurScratch) {
+  if (radiusX <= 1 && radiusY <= 1) {
+    return region.data
   }
 
   ensureScratch(scratch, region.data.length)
 
-  for (let pass = 0; pass < 3; pass += 1) {
-    const source = pass === 0 ? region.data : scratch.target
-    boxBlurHorizontal(source, scratch.temporary, region.width, region.height, radius)
-    boxBlurVertical(scratch.temporary, scratch.target, region.width, region.height, radius)
+  if (radiusX <= 1) {
+    boxBlurVertical(region.data, scratch.target, region.width, region.height, radiusY)
+    return scratch.target
   }
 
+  boxBlurHorizontal(region.data, scratch.temporary, region.width, region.height, radiusX)
+
+  if (radiusY <= 1) {
+    scratch.target.set(scratch.temporary)
+    return scratch.target
+  }
+
+  boxBlurVertical(scratch.temporary, scratch.target, region.width, region.height, radiusY)
   return scratch.target
-}
-
-function resolveBlurRadius(blurIntensity: number) {
-  const sliderIntensity = Number.isFinite(blurIntensity) ? clamp(blurIntensity, 0, 1) : 0.5
-  const effectiveIntensity = sliderIntensity <= 0.5
-    ? 0.5 + sliderIntensity
-    : sliderIntensity * 2
-
-  if (effectiveIntensity > 1) {
-    return Math.round(MAX_BLUR_RADIUS + ((effectiveIntensity - 1) * (MAX_BOOSTED_BLUR_RADIUS - MAX_BLUR_RADIUS)))
-  }
-
-  return Math.round(MIN_BLUR_RADIUS + (effectiveIntensity * (MAX_BLUR_RADIUS - MIN_BLUR_RADIUS)))
-}
-
-function blurRegion(region: RasterImage, radius: number, scratch: BlurScratch) {
-  if (Math.min(region.width, region.height) < radius) {
-    return pixelateRegion(region, Math.max(4, radius), scratch)
-  }
-
-  return gaussianApproximation(region, radius, scratch)
 }
 
 export function applyBlurEffects(
@@ -247,39 +193,66 @@ export function applyBlurEffects(
 ) {
   const output = new Uint8ClampedArray(image.data)
   const excludedFaces = new Set(excludedFaceIds)
-  const blurRadius = resolveBlurRadius(blurIntensity)
+  const blurFaces = faces.filter(face => !excludedFaces.has(face.id))
+
+  if (blurFaces.length === 0) {
+    return output
+  }
+
+  const normalizedIntensity = Number.isFinite(blurIntensity) ? clamp(blurIntensity, 0, 1) : 0.5
   const scratch: BlurScratch = {
     temporary: new Uint8ClampedArray(0),
     target: new Uint8ClampedArray(0)
   }
+  const pixelCount = image.width * image.height
+  const alphaAccum = new Float32Array(pixelCount)
+  const blurredAccum = new Uint8ClampedArray(pixelCount * 4)
 
-  for (const face of faces) {
-    if (excludedFaces.has(face.id)) {
-      continue
-    }
-
-    const padding = Math.max(6, Math.round(Math.min(face.width, face.height) * 0.12))
-    const region = extractRegion(image, face, padding)
-    const blurred = blurRegion(region, blurRadius, scratch)
-    const isInsideFace = createMaskChecker(face)
+  for (const face of blurFaces) {
+    const scaled = scaleFaceAroundCenter(face, MASK_SCALE)
+    const region = extractRegion(image, scaled, 0)
+    const radiusX = Math.max(MIN_BLUR_RADIUS, Math.round((scaled.width * normalizedIntensity) / 2))
+    const radiusY = Math.max(MIN_BLUR_RADIUS, Math.round((scaled.height * normalizedIntensity) / 2))
+    const blurred = boxBlurRegion(region, radiusX, radiusY, scratch)
+    const getMaskAlpha = createEllipseAlpha(scaled)
 
     for (let y = 0; y < region.height; y += 1) {
       for (let x = 0; x < region.width; x += 1) {
         const globalX = region.left + x
         const globalY = region.top + y
+        const alpha = getMaskAlpha(globalX, globalY)
 
-        if (!isInsideFace(globalX, globalY)) {
+        if (alpha <= 0) {
           continue
         }
 
-        const targetIndex = getPixelIndex(globalX, globalY, image.width)
+        const pixelIndex = (globalY * image.width) + globalX
         const sourceIndex = getPixelIndex(x, y, region.width)
-        output[targetIndex] = readByte(blurred, sourceIndex)
-        output[targetIndex + 1] = readByte(blurred, sourceIndex + 1)
-        output[targetIndex + 2] = readByte(blurred, sourceIndex + 2)
-        output[targetIndex + 3] = readByte(blurred, sourceIndex + 3)
+
+        if (alpha > (alphaAccum[pixelIndex] ?? 0)) {
+          alphaAccum[pixelIndex] = alpha
+          const targetIndex = pixelIndex * 4
+          blurredAccum[targetIndex] = readByte(blurred, sourceIndex)
+          blurredAccum[targetIndex + 1] = readByte(blurred, sourceIndex + 1)
+          blurredAccum[targetIndex + 2] = readByte(blurred, sourceIndex + 2)
+          blurredAccum[targetIndex + 3] = readByte(blurred, sourceIndex + 3)
+        }
       }
     }
+  }
+
+  for (let index = 0; index < pixelCount; index += 1) {
+    const alpha = alphaAccum[index] ?? 0
+
+    if (alpha <= 0) {
+      continue
+    }
+
+    const targetIndex = index * 4
+    output[targetIndex] = Math.round((readByte(blurredAccum, targetIndex) * alpha) + (readByte(image.data, targetIndex) * (1 - alpha)))
+    output[targetIndex + 1] = Math.round((readByte(blurredAccum, targetIndex + 1) * alpha) + (readByte(image.data, targetIndex + 1) * (1 - alpha)))
+    output[targetIndex + 2] = Math.round((readByte(blurredAccum, targetIndex + 2) * alpha) + (readByte(image.data, targetIndex + 2) * (1 - alpha)))
+    output[targetIndex + 3] = Math.round((readByte(blurredAccum, targetIndex + 3) * alpha) + (readByte(image.data, targetIndex + 3) * (1 - alpha)))
   }
 
   return output

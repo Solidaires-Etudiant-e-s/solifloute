@@ -1,7 +1,6 @@
 <script setup lang="ts">
 const inputRef = ref<HTMLInputElement | null>(null)
 const editor = useImageEditor()
-const isBusy = computed(() => editor.status.value === 'detecting' || editor.status.value === 'processing')
 const entries = computed(() => editor.uploadEntries.value)
 
 function formatMode(mode: 'client' | 'server') {
@@ -53,16 +52,42 @@ function formatDuration(durationMs: number | null) {
   return `${minutes} min ${String(seconds).padStart(2, '0')}s`
 }
 
+function downloadName(entry: { mediaKind: 'image' | 'video', fileName: string }) {
+  const baseName = entry.fileName.replace(/\.[^/.]+$/, '')
+  const extension = entry.mediaKind === 'video' ? 'mp4' : 'png'
+
+  return `visages-floutes-${baseName}.${extension}`
+}
+
 async function onFileChange(event: Event) {
   const target = event.target as HTMLInputElement
-  const nextFile = target.files?.[0]
+  const nextFiles = Array.from(target.files || [])
 
-  if (!nextFile) {
+  if (nextFiles.length === 0) {
     return
   }
 
-  await editor.loadFile(nextFile)
+  for (const nextFile of nextFiles) {
+    try {
+      await editor.loadFile(nextFile)
+    } catch {
+      // Best-effort: keep importing the remaining media.
+    }
+  }
+
   target.value = ''
+}
+
+async function onDrop(event: DragEvent) {
+  const nextFiles = Array.from(event.dataTransfer?.files || [])
+
+  for (const nextFile of nextFiles) {
+    try {
+      await editor.loadFile(nextFile)
+    } catch {
+      // Best-effort: keep importing the remaining media.
+    }
+  }
 }
 
 function openPicker() {
@@ -75,7 +100,12 @@ function isCurrentEntry(entryId: string) {
 </script>
 
 <template>
-  <main class="mx-auto flex min-h-screen max-w-7xl flex-col gap-8 px-4 py-8 sm:px-6 lg:px-8">
+  <main
+    class="mx-auto flex min-h-screen max-w-7xl flex-col gap-8 px-4 py-8 sm:px-6 lg:px-8"
+    @dragenter.prevent
+    @dragover.prevent
+    @drop.prevent="onDrop"
+  >
     <UModal
       v-model:open="editor.safariVideoModalOpen.value"
       title="Safari, c'est guez"
@@ -127,39 +157,13 @@ function isCurrentEntry(entryId: string) {
           >
             Importer un media
           </UButton>
-          <UButton
-            size="xl"
-            color="neutral"
-            variant="outline"
-            :disabled="!editor.file.value || isBusy"
-            @click="editor.processImage"
-          >
-            Traiter le media
-          </UButton>
-          <UButton
-            v-if="editor.status.value === 'processing' && editor.mediaKind.value === 'video'"
-            size="xl"
-            color="neutral"
-            variant="outline"
-            @click="editor.cancelVideoProcessing"
-          >
-            Annuler
-          </UButton>
-          <UButton
-            size="xl"
-            color="neutral"
-            variant="ghost"
-            :disabled="!editor.file.value"
-            @click="editor.clear"
-          >
-            Reinitialiser
-          </UButton>
         </div>
 
         <input
           ref="inputRef"
           type="file"
           accept="image/*,video/*"
+          multiple
           class="hidden"
           @change="onFileChange"
         >
@@ -168,7 +172,7 @@ function isCurrentEntry(entryId: string) {
       <SettingsPanel
         v-model="editor.settings"
         :active-mode="editor.activeMode.value"
-        :detected-count="editor.faces.value.length"
+        :server-only="editor.serverOnly.value"
       />
     </section>
 
@@ -223,6 +227,13 @@ function isCurrentEntry(entryId: string) {
             class="block w-full border border-(--ui-border)"
           />
 
+          <p
+            v-if="entry.warning"
+            class="text-sm text-(--ui-text-toned)"
+          >
+            {{ entry.warning }}
+          </p>
+
           <p class="text-sm text-(--ui-text-muted)">
             {{ entry.mediaKind === 'image'
               ? 'Cliquez sur un cadre pour l exclure du floutage, ou tracez une zone manuelle directement sur l image.'
@@ -249,12 +260,30 @@ function isCurrentEntry(entryId: string) {
 
               <UButton
                 v-if="entry.processedPreviewUrl"
+                color="neutral"
+                variant="outline"
+                @click="editor.retryEntry(entry.id)"
+              >
+                Recalculer
+              </UButton>
+
+              <UButton
+                v-if="entry.processedPreviewUrl"
                 :href="entry.processedPreviewUrl"
-                :download="entry.mediaKind === 'video' ? 'visages-floutes.mp4' : 'visages-floutes.png'"
+                :download="downloadName(entry)"
                 color="primary"
                 variant="soft"
               >
                 Telecharger
+              </UButton>
+
+              <UButton
+                v-if="entry.status === 'error'"
+                color="neutral"
+                variant="outline"
+                @click="editor.retryEntry(entry.id)"
+              >
+                Reessayer
               </UButton>
             </div>
           </div>
@@ -295,11 +324,19 @@ function isCurrentEntry(entryId: string) {
             </p>
             <div class="h-2 w-full overflow-hidden bg-(--ui-bg-elevated)">
               <div
+                v-if="entry.processingQueued"
+                class="h-full w-full animate-pulse bg-(--color-solired-500)"
+              />
+              <div
+                v-else
                 class="h-full bg-(--color-solired-500) transition-all"
                 :style="{ width: `${Math.round(entry.processingProgress * 100)}%` }"
               />
             </div>
-            <p class="text-sm text-(--ui-text-muted)">
+            <p
+              v-if="!entry.processingQueued"
+              class="text-sm text-(--ui-text-muted)"
+            >
               Progression : {{ Math.round(entry.processingProgress * 100) }}%
             </p>
             <p
@@ -325,6 +362,24 @@ function isCurrentEntry(entryId: string) {
           >
             {{ entry.error }}
           </p>
+
+          <div class="flex justify-center gap-3 pt-4">
+            <UButton
+              v-if="entry.status !== 'detecting' && entry.status !== 'processing'"
+              color="primary"
+              @click="editor.processEntry(entry.id)"
+            >
+              Traiter le media
+            </UButton>
+            <UButton
+              v-if="entry.status === 'processing' && entry.mediaKind === 'video'"
+              color="neutral"
+              variant="outline"
+              @click="editor.cancelEntryProcessing(entry.id)"
+            >
+              Annuler
+            </UButton>
+          </div>
         </div>
       </UCard>
     </section>

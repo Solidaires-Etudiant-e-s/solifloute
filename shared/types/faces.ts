@@ -9,12 +9,14 @@ export interface Face {
 
 export type ProcessingMode = 'auto' | 'client' | 'server'
 
+export type DetectionModel = 'fast' | 'advanced'
+
 export interface EditorSettings {
   confidenceThreshold: number
-  detectionIntervalSeconds: number
   blurIntensity: number
   processingMode: ProcessingMode
   excludedFaceIds: string[]
+  detectionModel: DetectionModel
 }
 
 export interface DetectionInput {

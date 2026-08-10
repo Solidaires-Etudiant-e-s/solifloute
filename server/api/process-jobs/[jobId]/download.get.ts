@@ -1,6 +1,6 @@
 import { getRouterParam } from 'h3'
 import { getOrCreateClientId } from '../../../utils/job-client'
-import { getJobForOwner, readJobOutput } from '../../../utils/video-jobs'
+import { getJobOutputStream, getJobForOwner } from '../../../utils/video-jobs'
 
 export default defineEventHandler(async (event) => {
   const ownerId = getOrCreateClientId(event)
@@ -22,7 +22,7 @@ export default defineEventHandler(async (event) => {
     })
   }
 
-  const output = await readJobOutput(jobId)
+  const output = getJobOutputStream(jobId)
 
   if (!output) {
     throw createError({
@@ -31,7 +31,9 @@ export default defineEventHandler(async (event) => {
     })
   }
 
-  setHeader(event, 'content-type', job.mimeType || 'application/octet-stream')
+  setHeader(event, 'content-type', output.mimeType)
+  setHeader(event, 'content-disposition', `attachment; filename="${output.fileName}"`)
+  setHeader(event, 'content-length', output.size)
   setHeader(event, 'cache-control', 'no-store')
-  return output
+  return sendStream(event, output.stream)
 })

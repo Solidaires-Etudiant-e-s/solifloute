@@ -1,54 +1,29 @@
 import type { Face } from '../types/faces'
 
-const VIDEO_BLUR_SCALE = 1.5
-const FACE_MATCH_MAX_SCORE = 2.4
+export const FACE_MATCH_MAX_SCORE = 1.5
 const HIGH_CONFIDENCE_FACE = 0.9
+const FACE_MATCH_DISTANCE_RATIO = 1.5
+const SMALL_FACE_MAX_SIZE = 36
+const FAST_MOTION_RATIO = 0.2
 
 export interface FaceSample {
   frameIndex: number
   faces: Face[]
 }
 
-interface FaceResolverOptions {
-  appearanceLookbackFrames?: number
-  disappearanceLookaheadFrames?: number
-  trajectoryWindowFrames?: number
+export type ResolvedFaceSource = 'detection' | 'interpolated' | 'appearance-ext' | 'disappearance-ext'
+
+export interface ResolvedFace extends Face {
+  source: ResolvedFaceSource
 }
 
-interface FaceTrajectoryPoint {
+interface Detection {
   frameIndex: number
   face: Face
 }
 
-interface FacePair {
-  from?: Face
-  to?: Face
-  appearanceExtension?: {
-    startFrame: number
-    trajectory: FaceTrajectoryPoint[]
-  } | null
-  disappearanceExtension?: {
-    endFrame: number
-    trajectory: FaceTrajectoryPoint[]
-  } | null
-}
-
-interface FaceSegment {
-  startFrame: number
-  endFrame: number
-  pairs: FacePair[]
-}
-
-type FaceMatcher = (targetFace: Face, candidateFace: Face, score: number) => boolean
-
-function cloneFace(face: Face) {
-  return {
-    ...face
-  }
-}
-
-function lerp(start: number, end: number, t: number) {
-  return start + ((end - start) * t)
+interface FaceTrack {
+  detections: Detection[]
 }
 
 function centerDistance(faceA: Face, faceB: Face) {
@@ -65,47 +40,46 @@ function overlapRatio(faceA: Face, faceB: Face) {
   const top = Math.max(faceA.y, faceB.y)
   const right = Math.min(faceA.x + faceA.width, faceB.x + faceB.width)
   const bottom = Math.min(faceA.y + faceA.height, faceB.y + faceB.height)
-  const intersectionWidth = Math.max(0, right - left)
-  const intersectionHeight = Math.max(0, bottom - top)
-  const intersectionArea = intersectionWidth * intersectionHeight
-
-  if (intersectionArea <= 0) {
-    return 0
-  }
-
+  const intersectionArea = Math.max(0, right - left) * Math.max(0, bottom - top)
   const smallestArea = Math.max(1, Math.min(faceA.width * faceA.height, faceB.width * faceB.height))
+
   return intersectionArea / smallestArea
 }
 
-function isHighConfidenceMatch(faceA: Face, faceB: Face) {
-  const closeEnough = centerDistance(faceA, faceB) <= Math.max(faceA.width, faceA.height, faceB.width, faceB.height) * 2.5
-  const overlapEnough = overlapRatio(faceA, faceB) >= 0.1
-
+function sizeDifference(faceA: Face, faceB: Face) {
   return (
-    Math.max(faceA.confidence, faceB.confidence) >= HIGH_CONFIDENCE_FACE
-    && (closeEnough || overlapEnough)
+    Math.abs(faceA.width - faceB.width) / Math.max(1, Math.max(faceA.width, faceB.width))
+    + Math.abs(faceA.height - faceB.height) / Math.max(1, Math.max(faceA.height, faceB.height))
   )
-}
-
-function canMatchFaces(faceA: Face, faceB: Face, score: number) {
-  return score <= FACE_MATCH_MAX_SCORE || isHighConfidenceMatch(faceA, faceB)
 }
 
 function matchScore(faceA: Face, faceB: Face) {
   const averageSize = Math.max(1, (faceA.width + faceA.height + faceB.width + faceB.height) / 4)
-  const distanceScore = centerDistance(faceA, faceB) / averageSize
-  const sizeScore = (
-    Math.abs(faceA.width - faceB.width) / Math.max(1, Math.max(faceA.width, faceB.width))
-    + Math.abs(faceA.height - faceB.height) / Math.max(1, Math.max(faceA.height, faceB.height))
-  )
 
-  return distanceScore + sizeScore
+  return centerDistance(faceA, faceB) / averageSize + sizeDifference(faceA, faceB)
+}
+
+function isHighConfidenceMatch(faceA: Face, faceB: Face) {
+  const smallerMaxSize = Math.min(
+    Math.max(faceA.width, faceA.height),
+    Math.max(faceB.width, faceB.height)
+  )
+  const closeEnough = centerDistance(faceA, faceB) <= smallerMaxSize * FACE_MATCH_DISTANCE_RATIO
+
+  return (
+    Math.max(faceA.confidence, faceB.confidence) >= HIGH_CONFIDENCE_FACE
+    && (closeEnough || overlapRatio(faceA, faceB) >= 0.1)
+  )
+}
+
+function canMatch(faceA: Face, faceB: Face, score: number) {
+  return score <= FACE_MATCH_MAX_SCORE || isHighConfidenceMatch(faceA, faceB)
 }
 
 function matchFaces(previousFaces: Face[], nextFaces: Face[]) {
   const remainingPrevious = new Set(previousFaces.map((_, index) => index))
   const remainingNext = new Set(nextFaces.map((_, index) => index))
-  const pairs: FacePair[] = []
+  const pairs: Array<{ fromIndex: number, toIndex: number }> = []
 
   while (remainingPrevious.size > 0 && remainingNext.size > 0) {
     let bestPreviousIndex = -1
@@ -124,68 +98,436 @@ function matchFaces(previousFaces: Face[], nextFaces: Face[]) {
       }
     }
 
-    if (bestPreviousIndex < 0 || bestNextIndex < 0) {
+    if (
+      bestPreviousIndex < 0
+      || bestNextIndex < 0
+      || !canMatch(previousFaces[bestPreviousIndex]!, nextFaces[bestNextIndex]!, bestScore)
+    ) {
       break
     }
 
-    const previousFace = previousFaces[bestPreviousIndex]!
-    const nextFace = nextFaces[bestNextIndex]!
-
-    if (!canMatchFaces(previousFace, nextFace, bestScore)) {
-      break
-    }
-
-    pairs.push({
-      from: previousFace,
-      to: nextFace
-    })
+    pairs.push({ fromIndex: bestPreviousIndex, toIndex: bestNextIndex })
     remainingPrevious.delete(bestPreviousIndex)
     remainingNext.delete(bestNextIndex)
-  }
-
-  for (const previousIndex of remainingPrevious) {
-    pairs.push({
-      from: previousFaces[previousIndex]
-    })
-  }
-
-  for (const nextIndex of remainingNext) {
-    pairs.push({
-      to: nextFaces[nextIndex]
-    })
   }
 
   return pairs
 }
 
-function findBestFace(targetFace: Face, faces: Face[], canUseFace: FaceMatcher) {
-  let bestFace: Face | null = null
-  let bestScore = Number.POSITIVE_INFINITY
+function buildTracks(samples: FaceSample[]): FaceTrack[] {
+  const trackIdByFaceKey = new Map<string, number>()
+  const tracks: FaceTrack[] = []
+  let nextTrackId = 0
 
-  for (const face of faces) {
-    const score = matchScore(targetFace, face)
+  function ensureTrack(keys: string[]) {
+    for (const key of keys) {
+      const existing = trackIdByFaceKey.get(key)
+      if (existing !== undefined) {
+        return existing
+      }
+    }
 
-    if (score < bestScore && canUseFace(targetFace, face, score)) {
-      bestScore = score
-      bestFace = face
+    const trackId = nextTrackId
+    nextTrackId += 1
+    tracks.push({ detections: [] })
+    for (const key of keys) {
+      trackIdByFaceKey.set(key, trackId)
+    }
+
+    return trackId
+  }
+
+  for (let sampleIndex = 0; sampleIndex < samples.length - 1; sampleIndex += 1) {
+    const previousFaces = samples[sampleIndex]!.faces
+    const nextFaces = samples[sampleIndex + 1]!.faces
+
+    for (const { fromIndex, toIndex } of matchFaces(previousFaces, nextFaces)) {
+      ensureTrack([`${sampleIndex}:${fromIndex}`, `${sampleIndex + 1}:${toIndex}`])
     }
   }
 
-  return bestFace
-}
+  for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex += 1) {
+    const sample = samples[sampleIndex]!
 
-function findMatchingFace(targetFace: Face, faces: Face[]) {
-  return findBestFace(targetFace, faces, canMatchFaces)
-}
-
-function findAppearanceFace(targetFace: Face, faces: Face[]) {
-  const exactMatch = findMatchingFace(targetFace, faces)
-
-  if (exactMatch) {
-    return exactMatch
+    for (let faceIndex = 0; faceIndex < sample.faces.length; faceIndex += 1) {
+      const trackId = trackIdByFaceKey.get(`${sampleIndex}:${faceIndex}`) ?? ensureTrack([`${sampleIndex}:${faceIndex}`])
+      tracks[trackId]!.detections.push({
+        frameIndex: sample.frameIndex,
+        face: sample.faces[faceIndex]!
+      })
+    }
   }
 
-  return findBestFace(targetFace, faces, (faceA, faceB) => isHighConfidenceMatch(faceA, faceB))
+  return tracks.filter(track => track.detections.length > 0)
+}
+
+function removeIsolatedTracks(tracks: FaceTrack[], samples: FaceSample[], windowFrames: number): FaceTrack[] {
+  return tracks.filter((track) => {
+    if (track.detections.length > 1) {
+      return true
+    }
+
+    const detection = track.detections[0]!
+    for (const sample of samples) {
+      const frameDistance = Math.abs(sample.frameIndex - detection.frameIndex)
+      if (frameDistance === 0 || frameDistance > windowFrames) {
+        continue
+      }
+      for (const face of sample.faces) {
+        if (canMatch(detection.face, face, matchScore(detection.face, face))) {
+          return true
+        }
+      }
+    }
+
+    return false
+  })
+}
+
+function tracksCompatible(previousFace: Face, nextFace: Face) {
+  const maxSize = Math.max(
+    previousFace.width,
+    previousFace.height,
+    nextFace.width,
+    nextFace.height
+  )
+
+  return centerDistance(previousFace, nextFace) <= maxSize * FACE_MATCH_DISTANCE_RATIO || overlapRatio(previousFace, nextFace) >= 0.1
+}
+
+function mergeTracks(tracks: FaceTrack[], gapFrames: number): FaceTrack[] {
+  if (gapFrames <= 0) {
+    return tracks
+  }
+
+  const orderedTracks = [...tracks].sort((left, right) => {
+    return left.detections[0]!.frameIndex - right.detections[0]!.frameIndex
+  })
+  const mergedTracks: FaceTrack[] = []
+
+  for (const track of orderedTracks) {
+    const currentStartFrame = track.detections[0]!.frameIndex
+    const currentFirstFace = track.detections[0]!.face
+    let bestPreviousTrack: FaceTrack | null = null
+    let bestDistance = Number.POSITIVE_INFINITY
+
+    for (let index = mergedTracks.length - 1; index >= 0; index -= 1) {
+      const previousTrack = mergedTracks[index]!
+      const previousEndFrame = previousTrack.detections[previousTrack.detections.length - 1]!.frameIndex
+      const gap = currentStartFrame - previousEndFrame
+
+      if (gap <= 0 || gap > gapFrames) {
+        continue
+      }
+
+      const previousLastFace = previousTrack.detections[previousTrack.detections.length - 1]!.face
+
+      if (!tracksCompatible(previousLastFace, currentFirstFace)) {
+        continue
+      }
+
+      const distance = centerDistance(previousLastFace, currentFirstFace)
+
+      if (distance < bestDistance) {
+        bestDistance = distance
+        bestPreviousTrack = previousTrack
+      }
+    }
+
+    if (bestPreviousTrack) {
+      bestPreviousTrack.detections.push(...track.detections)
+      bestPreviousTrack.detections.sort((left, right) => left.frameIndex - right.frameIndex)
+      continue
+    }
+
+    mergedTracks.push(track)
+  }
+
+  return mergedTracks
+}
+
+function trackIsUnstable(track: FaceTrack) {
+  const detections = track.detections
+
+  if (detections.length === 0) {
+    return false
+  }
+
+  let sizeSum = 0
+  let motionSum = 0
+  let motionCount = 0
+  let hasFastSegment = false
+
+  for (let index = 0; index < detections.length; index += 1) {
+    const face = detections[index]!.face
+    sizeSum += Math.max(face.width, face.height)
+
+    if (index > 0) {
+      const previousFace = detections[index - 1]!.face
+      const gap = Math.max(1, detections[index]!.frameIndex - detections[index - 1]!.frameIndex)
+      const motionPerFrame = centerDistance(previousFace, face) / gap
+      motionSum += motionPerFrame
+      motionCount += 1
+
+      const segmentSize = Math.max(
+        Math.max(previousFace.width, previousFace.height),
+        Math.max(face.width, face.height)
+      )
+      if (motionPerFrame / Math.max(1, segmentSize) > FAST_MOTION_RATIO) {
+        hasFastSegment = true
+      }
+    }
+  }
+
+  const averageSize = sizeSum / detections.length
+
+  if (averageSize < SMALL_FACE_MAX_SIZE) {
+    return true
+  }
+
+  const averageMotion = motionCount > 0 ? motionSum / motionCount : 0
+  return averageMotion / Math.max(1, averageSize) > FAST_MOTION_RATIO || hasFastSegment
+}
+
+function smoothTrack(track: FaceTrack, windowSize: number, smoothPosition = true) {
+  const half = Math.floor(windowSize / 2)
+
+  for (let index = 0; index < track.detections.length; index += 1) {
+    const start = Math.max(0, index - half)
+    const end = Math.min(track.detections.length - 1, index + half)
+    let weightSum = 0
+    let x = 0
+    let y = 0
+    let width = 0
+    let height = 0
+
+    for (let otherIndex = start; otherIndex <= end; otherIndex += 1) {
+      const other = track.detections[otherIndex]!
+      const weight = 1 / (Math.abs(otherIndex - index) + 1)
+      x += other.face.x * weight
+      y += other.face.y * weight
+      width += other.face.width * weight
+      height += other.face.height * weight
+      weightSum += weight
+    }
+
+    const face = track.detections[index]!.face
+
+    if (smoothPosition) {
+      face.x = Math.round(x / weightSum)
+      face.y = Math.round(y / weightSum)
+    }
+
+    face.width = Math.round(width / weightSum)
+    face.height = Math.round(height / weightSum)
+  }
+}
+
+function lerp(start: number, end: number, t: number) {
+  return start + ((end - start) * t)
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function cloneFace(face: Face): Face {
+  return { ...face }
+}
+
+interface GlobalMotion {
+  dx: number
+  dy: number
+}
+
+function faceCenter(face: Face) {
+  return { x: face.x + (face.width / 2), y: face.y + (face.height / 2) }
+}
+
+function median(values: number[]) {
+  if (values.length === 0) {
+    return 0
+  }
+  const sorted = [...values].sort((left, right) => left - right)
+  return sorted[Math.floor(sorted.length / 2)]!
+}
+
+function estimateGlobalMotion(tracks: FaceTrack[]): Map<number, GlobalMotion> {
+  const samplesByFrame = new Map<number, Array<{ dx: number, dy: number }>>()
+
+  for (const track of tracks) {
+    for (let index = 1; index < track.detections.length; index += 1) {
+      const current = track.detections[index]!
+      const previous = track.detections[index - 1]!
+
+      if (current.frameIndex !== previous.frameIndex + 1) {
+        continue
+      }
+
+      const previousCenter = faceCenter(previous.face)
+      const currentCenter = faceCenter(current.face)
+      const samples = samplesByFrame.get(previous.frameIndex) ?? []
+      samples.push({
+        dx: currentCenter.x - previousCenter.x,
+        dy: currentCenter.y - previousCenter.y
+      })
+      samplesByFrame.set(previous.frameIndex, samples)
+    }
+  }
+
+  const motion = new Map<number, GlobalMotion>()
+
+  for (const [frameIndex, samples] of samplesByFrame) {
+    motion.set(frameIndex, {
+      dx: median(samples.map(sample => sample.dx)),
+      dy: median(samples.map(sample => sample.dy))
+    })
+  }
+
+  return motion
+}
+
+function cameraMotionAt(globalMotion: Map<number, GlobalMotion>, frameIndex: number): GlobalMotion {
+  const maxDistance = 60
+
+  for (let distance = 0; distance <= maxDistance; distance += 1) {
+    const after = globalMotion.get(frameIndex + distance)
+
+    if (after) {
+      return after
+    }
+
+    const before = globalMotion.get(frameIndex - distance)
+
+    if (before) {
+      return before
+    }
+  }
+
+  return { dx: 0, dy: 0 }
+}
+
+function sumCameraMotion(globalMotion: Map<number, GlobalMotion>, startFrame: number, endFrame: number): GlobalMotion {
+  let dx = 0
+  let dy = 0
+
+  for (let frameIndex = startFrame; frameIndex <= endFrame; frameIndex += 1) {
+    const motion = cameraMotionAt(globalMotion, frameIndex)
+    dx += motion.dx
+    dy += motion.dy
+  }
+
+  return { dx, dy }
+}
+
+function projectBeforeTrack(track: FaceTrack, frameIndex: number, globalMotion: Map<number, GlobalMotion>): Face {
+  const firstDetection = track.detections[0]!
+  const framesBefore = firstDetection.frameIndex - frameIndex
+
+  if (framesBefore <= 0) {
+    return cloneFace(firstDetection.face)
+  }
+
+  let residualVelocityX = 0
+  let residualVelocityY = 0
+  const maxShift = Math.max(4, Math.min(48, firstDetection.face.width * 0.6))
+
+  if (track.detections.length >= 2) {
+    const secondDetection = track.detections[1]!
+    const span = Math.max(1, secondDetection.frameIndex - firstDetection.frameIndex)
+    const faceVelocityX = (secondDetection.face.x - firstDetection.face.x) / span
+    const faceVelocityY = (secondDetection.face.y - firstDetection.face.y) / span
+    const cameraMotion = sumCameraMotion(globalMotion, firstDetection.frameIndex, secondDetection.frameIndex - 1)
+    const cameraVelocityX = cameraMotion.dx / span
+    const cameraVelocityY = cameraMotion.dy / span
+    residualVelocityX = clampNumber(faceVelocityX - cameraVelocityX, -maxShift, maxShift)
+    residualVelocityY = clampNumber(faceVelocityY - cameraVelocityY, -maxShift, maxShift)
+  }
+
+  const cameraShift = sumCameraMotion(globalMotion, frameIndex, firstDetection.frameIndex - 1)
+  const velocityWidth = track.detections.length >= 2
+    ? (track.detections[1]!.face.width - firstDetection.face.width) / Math.max(1, track.detections[1]!.frameIndex - firstDetection.frameIndex)
+    : 0
+  const velocityHeight = track.detections.length >= 2
+    ? (track.detections[1]!.face.height - firstDetection.face.height) / Math.max(1, track.detections[1]!.frameIndex - firstDetection.frameIndex)
+    : 0
+
+  const residualShiftX = clampNumber(residualVelocityX * framesBefore, -maxShift, maxShift)
+  const residualShiftY = clampNumber(residualVelocityY * framesBefore, -maxShift, maxShift)
+  const totalShiftX = clampNumber(cameraShift.dx + residualShiftX, -maxShift, maxShift)
+  const totalShiftY = clampNumber(cameraShift.dy + residualShiftY, -maxShift, maxShift)
+
+  return {
+    id: firstDetection.face.id,
+    x: Math.round(firstDetection.face.x - totalShiftX),
+    y: Math.round(firstDetection.face.y - totalShiftY),
+    width: Math.round(clampNumber(
+      firstDetection.face.width - (velocityWidth * framesBefore),
+      firstDetection.face.width * 0.75,
+      firstDetection.face.width * 1.25
+    )),
+    height: Math.round(clampNumber(
+      firstDetection.face.height - (velocityHeight * framesBefore),
+      firstDetection.face.height * 0.75,
+      firstDetection.face.height * 1.25
+    )),
+    confidence: firstDetection.face.confidence
+  }
+}
+
+function projectAfterTrack(track: FaceTrack, frameIndex: number, globalMotion: Map<number, GlobalMotion>): Face {
+  const lastDetection = track.detections[track.detections.length - 1]!
+  const framesAfter = frameIndex - lastDetection.frameIndex
+
+  if (framesAfter <= 0) {
+    return cloneFace(lastDetection.face)
+  }
+
+  let residualVelocityX = 0
+  let residualVelocityY = 0
+  const maxShift = Math.max(4, Math.min(48, lastDetection.face.width * 0.6))
+
+  if (track.detections.length >= 2) {
+    const previousDetection = track.detections[track.detections.length - 2]!
+    const span = Math.max(1, lastDetection.frameIndex - previousDetection.frameIndex)
+    const faceVelocityX = (lastDetection.face.x - previousDetection.face.x) / span
+    const faceVelocityY = (lastDetection.face.y - previousDetection.face.y) / span
+    const cameraMotion = sumCameraMotion(globalMotion, previousDetection.frameIndex, lastDetection.frameIndex - 1)
+    const cameraVelocityX = cameraMotion.dx / span
+    const cameraVelocityY = cameraMotion.dy / span
+    residualVelocityX = clampNumber(faceVelocityX - cameraVelocityX, -maxShift, maxShift)
+    residualVelocityY = clampNumber(faceVelocityY - cameraVelocityY, -maxShift, maxShift)
+  }
+
+  const cameraShift = sumCameraMotion(globalMotion, lastDetection.frameIndex + 1, frameIndex)
+  const velocityWidth = track.detections.length >= 2
+    ? (lastDetection.face.width - track.detections[track.detections.length - 2]!.face.width) / Math.max(1, lastDetection.frameIndex - track.detections[track.detections.length - 2]!.frameIndex)
+    : 0
+  const velocityHeight = track.detections.length >= 2
+    ? (lastDetection.face.height - track.detections[track.detections.length - 2]!.face.height) / Math.max(1, lastDetection.frameIndex - track.detections[track.detections.length - 2]!.frameIndex)
+    : 0
+
+  const residualShiftX = clampNumber(residualVelocityX * framesAfter, -maxShift, maxShift)
+  const residualShiftY = clampNumber(residualVelocityY * framesAfter, -maxShift, maxShift)
+  const totalShiftX = clampNumber(cameraShift.dx + residualShiftX, -maxShift, maxShift)
+  const totalShiftY = clampNumber(cameraShift.dy + residualShiftY, -maxShift, maxShift)
+
+  return {
+    id: lastDetection.face.id,
+    x: Math.round(lastDetection.face.x + totalShiftX),
+    y: Math.round(lastDetection.face.y + totalShiftY),
+    width: Math.round(clampNumber(
+      lastDetection.face.width + (velocityWidth * framesAfter),
+      lastDetection.face.width * 0.75,
+      lastDetection.face.width * 1.25
+    )),
+    height: Math.round(clampNumber(
+      lastDetection.face.height + (velocityHeight * framesAfter),
+      lastDetection.face.height * 0.75,
+      lastDetection.face.height * 1.25
+    )),
+    confidence: lastDetection.face.confidence
+  }
 }
 
 function interpolateFace(faceA: Face, faceB: Face, t: number): Face {
@@ -195,426 +537,163 @@ function interpolateFace(faceA: Face, faceB: Face, t: number): Face {
     y: Math.round(lerp(faceA.y, faceB.y, t)),
     width: Math.round(lerp(faceA.width, faceB.width, t)),
     height: Math.round(lerp(faceA.height, faceB.height, t)),
-    confidence: Number(Math.max(0, Math.min(1, lerp(faceA.confidence, faceB.confidence, t))).toFixed(4))
+    confidence: faceA.confidence
   }
 }
 
-function projectFaceFromPoints(
-  points: FaceTrajectoryPoint[],
-  frameIndex: number,
-  fallbackFace: Face
-) {
-  if (points.length === 0) {
-    return cloneFace(fallbackFace)
-  }
-
-  if (points.length === 1) {
-    return cloneFace(points[0]!.face)
-  }
-
-  const orderedPoints = [...points].sort((left, right) => left.frameIndex - right.frameIndex)
-  const firstPoint = orderedPoints[0]!
-  const lastPoint = orderedPoints[orderedPoints.length - 1]!
-
-  if (frameIndex <= firstPoint.frameIndex) {
-    const nextPoint = orderedPoints[1]!
-    const span = Math.max(1, nextPoint.frameIndex - firstPoint.frameIndex)
-    return interpolateFace(firstPoint.face, nextPoint.face, (frameIndex - firstPoint.frameIndex) / span)
-  }
-
-  if (frameIndex >= lastPoint.frameIndex) {
-    const previousPoint = orderedPoints[orderedPoints.length - 2]!
-    const span = Math.max(1, lastPoint.frameIndex - previousPoint.frameIndex)
-    return interpolateFace(previousPoint.face, lastPoint.face, (frameIndex - previousPoint.frameIndex) / span)
-  }
-
-  for (let index = 0; index < orderedPoints.length - 1; index += 1) {
-    const leftPoint = orderedPoints[index]!
-    const rightPoint = orderedPoints[index + 1]!
-
-    if (frameIndex < leftPoint.frameIndex || frameIndex > rightPoint.frameIndex) {
-      continue
-    }
-
-    const span = Math.max(1, rightPoint.frameIndex - leftPoint.frameIndex)
-    return interpolateFace(leftPoint.face, rightPoint.face, (frameIndex - leftPoint.frameIndex) / span)
-  }
-
-  return cloneFace(fallbackFace)
+function pushFace(resolvedFrames: Map<number, ResolvedFace[]>, frameIndex: number, face: Face, source: ResolvedFaceSource) {
+  const faces = resolvedFrames.get(frameIndex) ?? []
+  faces.push({ ...face, source })
+  resolvedFrames.set(frameIndex, faces)
 }
 
-function scaleFace(face: Face, scale: number): Face {
-  const width = Math.round(face.width * scale)
-  const height = Math.round(face.height * scale)
-
+function clampToFrame(face: Face, frameWidth: number, frameHeight: number): Face {
   return {
     ...face,
-    x: Math.round(face.x - ((width - face.width) / 2)),
-    y: Math.round(face.y - ((height - face.height) / 2)),
-    width,
-    height
+    x: clampNumber(face.x, 0, Math.max(0, frameWidth - face.width)),
+    y: clampNumber(face.y, 0, Math.max(0, frameHeight - face.height))
   }
 }
 
-export function expandVideoBlurFaces(faces: Face[]) {
-  return faces.map(face => scaleFace(face, VIDEO_BLUR_SCALE))
-}
+function fillTrackGaps(track: FaceTrack, gapFrames: number, resolvedFrames: Map<number, ResolvedFace[]>) {
+  for (let index = 0; index < track.detections.length - 1; index += 1) {
+    const current = track.detections[index]!
+    const next = track.detections[index + 1]!
+    const gap = next.frameIndex - current.frameIndex
 
-async function assignAppearanceFrames(
-  targetFaces: Face[],
-  startFrame: number,
-  endFrame: number,
-  detectFacesAtFrame: (frameIndex: number) => Promise<Face[]>,
-  resolvedFrames: Map<Face, number>
-) {
-  if (targetFaces.length === 0) {
-    return
-  }
-
-  if (endFrame - startFrame <= 1) {
-    for (const face of targetFaces) {
-      resolvedFrames.set(face, endFrame)
-    }
-
-    return
-  }
-
-  const probeFrame = startFrame + Math.max(1, Math.floor((endFrame - startFrame) / 2))
-  const faces = await detectFacesAtFrame(probeFrame)
-  const appearedFaces: Face[] = []
-  const missingFaces: Face[] = []
-
-  for (const targetFace of targetFaces) {
-    if (findAppearanceFace(targetFace, faces)) {
-      appearedFaces.push(targetFace)
+    if (gap <= 1 || gap > gapFrames) {
       continue
     }
 
-    missingFaces.push(targetFace)
+    for (let frameIndex = current.frameIndex + 1; frameIndex < next.frameIndex; frameIndex += 1) {
+      const t = (frameIndex - current.frameIndex) / gap
+      pushFace(resolvedFrames, frameIndex, interpolateFace(current.face, next.face, t), 'interpolated')
+    }
   }
-
-  await assignAppearanceFrames(appearedFaces, startFrame, probeFrame, detectFacesAtFrame, resolvedFrames)
-  await assignAppearanceFrames(missingFaces, probeFrame, endFrame, detectFacesAtFrame, resolvedFrames)
 }
 
-export async function refineFaceSamples(
-  samples: FaceSample[],
-  detectFacesAtFrame: (frameIndex: number) => Promise<Face[]>,
-  onProgress?: (completedIntervals: number, totalIntervals: number) => void
+function fillTrackExtension(
+  track: FaceTrack,
+  options: { appearanceFrames: number, disappearanceFrames: number, frameCount: number },
+  resolvedFrames: Map<number, ResolvedFace[]>,
+  globalMotion: Map<number, GlobalMotion>,
+  frameWidth: number,
+  frameHeight: number
 ) {
-  if (samples.length <= 1) {
-    return samples
+  const { appearanceFrames, disappearanceFrames, frameCount } = options
+  const firstDetection = track.detections[0]!
+  const lastDetection = track.detections[track.detections.length - 1]!
+
+  if (track.detections.length < 2) {
+    return
   }
 
-  const orderedSamples = [...samples].sort((left, right) => left.frameIndex - right.frameIndex)
-  const sampleMap = new Map<number, Face[]>(orderedSamples.map(sample => [sample.frameIndex, sample.faces]))
-  const detectionCache = new Map<number, Face[]>(orderedSamples.map(sample => [sample.frameIndex, sample.faces]))
-  const totalIntervals = Math.max(1, orderedSamples.length - 1)
-
-  async function getFaces(frameIndex: number) {
-    const cached = detectionCache.get(frameIndex)
-
-    if (cached) {
-      return cached
+  if (appearanceFrames > 0) {
+    const firstFrame = Math.max(0, firstDetection.frameIndex - appearanceFrames)
+    for (let frameIndex = firstFrame; frameIndex < firstDetection.frameIndex; frameIndex += 1) {
+      pushFace(resolvedFrames, frameIndex, clampToFrame(projectBeforeTrack(track, frameIndex, globalMotion), frameWidth, frameHeight), 'appearance-ext')
     }
-
-    const faces = await detectFacesAtFrame(frameIndex)
-    detectionCache.set(frameIndex, faces)
-
-    if (faces.some(face => face.confidence >= HIGH_CONFIDENCE_FACE) && !sampleMap.has(frameIndex)) {
-      sampleMap.set(frameIndex, faces)
-    }
-
-    return faces
   }
 
-  for (let index = 0; index < orderedSamples.length - 1; index += 1) {
-    const previousSample = orderedSamples[index]!
-    const nextSample = orderedSamples[index + 1]!
-    const pairs = matchFaces(previousSample.faces, nextSample.faces)
-    const newFaces = pairs
-      .filter(pair => !pair.from && pair.to)
-      .map(pair => pair.to!)
-    const appearanceFrames = new Map<Face, number>()
+  if (disappearanceFrames > 0) {
+    const lastFrame = Math.min(frameCount - 1, lastDetection.frameIndex + disappearanceFrames)
+    for (let frameIndex = lastDetection.frameIndex + 1; frameIndex <= lastFrame; frameIndex += 1) {
+      pushFace(resolvedFrames, frameIndex, clampToFrame(projectAfterTrack(track, frameIndex, globalMotion), frameWidth, frameHeight), 'disappearance-ext')
+    }
+  }
+}
 
-    await assignAppearanceFrames(
-      newFaces,
-      previousSample.frameIndex,
-      nextSample.frameIndex,
-      getFaces,
-      appearanceFrames
+function deduplicateFrameFaces(faces: ResolvedFace[]): ResolvedFace[] {
+  const sorted = [...faces].sort((left, right) => {
+    const priority = (source: ResolvedFaceSource) => (
+      source === 'detection'
+        ? 2
+        : source === 'interpolated'
+          ? 1
+          : 0
     )
+    return priority(right.source) - priority(left.source) || right.confidence - left.confidence
+  })
+  const kept: ResolvedFace[] = []
 
-    for (const appearanceFrame of appearanceFrames.values()) {
-      if (sampleMap.has(appearanceFrame)) {
-        continue
+  for (const face of sorted) {
+    const isDuplicate = kept.some((other) => {
+      const minSize = Math.min(face.width, face.height, other.width, other.height)
+      const closeCenters = centerDistance(face, other) <= minSize * 0.3
+      const sizesSimilar = Math.max(face.width, face.height, other.width, other.height) <= minSize * 1.5
+      const bothDetections = face.source === 'detection' && other.source === 'detection'
+
+      if (bothDetections) {
+        return sizesSimilar && (overlapRatio(face, other) >= 0.5 || closeCenters)
       }
 
-      sampleMap.set(appearanceFrame, await getFaces(appearanceFrame))
-    }
-
-    onProgress?.(index + 1, totalIntervals)
-  }
-
-  return [...sampleMap.entries()]
-    .sort((left, right) => left[0] - right[0])
-    .map(([frameIndex, faces]) => ({ frameIndex, faces }))
-}
-
-function collectTrajectoryPoints(
-  samples: FaceSample[],
-  startSampleIndex: number,
-  startFace: Face,
-  direction: 'backward' | 'forward',
-  trajectoryWindowFrames: number
-) {
-  const originFrame = samples[startSampleIndex]!.frameIndex
-  const points: FaceTrajectoryPoint[] = [{
-    frameIndex: originFrame,
-    face: startFace
-  }]
-
-  if (trajectoryWindowFrames <= 0) {
-    return points
-  }
-
-  let currentFace = startFace
-
-  if (direction === 'forward') {
-    for (let index = startSampleIndex + 1; index < samples.length; index += 1) {
-      const sample = samples[index]!
-
-      if (sample.frameIndex - originFrame > trajectoryWindowFrames) {
-        break
-      }
-
-      const match = findMatchingFace(currentFace, sample.faces)
-
-      if (!match) {
-        break
-      }
-
-      points.push({
-        frameIndex: sample.frameIndex,
-        face: match
-      })
-      currentFace = match
-    }
-
-    return points
-  }
-
-  for (let index = startSampleIndex - 1; index >= 0; index -= 1) {
-    const sample = samples[index]!
-
-    if (originFrame - sample.frameIndex > trajectoryWindowFrames) {
-      break
-    }
-
-    const match = findMatchingFace(currentFace, sample.faces)
-
-    if (!match) {
-      break
-    }
-
-    points.unshift({
-      frameIndex: sample.frameIndex,
-      face: match
+      return overlapRatio(face, other) >= 0.2 || closeCenters
     })
-    currentFace = match
+
+    if (!isDuplicate) {
+      kept.push(face)
+    }
   }
 
-  return points
+  kept.sort((left, right) => (right.width * right.height) - (left.width * left.height))
+
+  return kept
 }
 
-function createAppearanceExtension(
-  appearanceFace: Face,
-  appearanceSampleIndex: number,
-  previousFrame: number,
-  samples: FaceSample[],
-  lookbackFrames: number,
-  trajectoryWindowFrames: number
-) {
-  if (lookbackFrames <= 0) {
-    return null
-  }
-
-  const appearanceFrame = samples[appearanceSampleIndex]!.frameIndex
-  const startFrame = Math.max(previousFrame + 1, appearanceFrame - lookbackFrames)
-
-  if (startFrame >= appearanceFrame) {
-    return null
-  }
-
-  const trajectory = collectTrajectoryPoints(
-    samples,
-    appearanceSampleIndex,
-    appearanceFace,
-    'forward',
-    trajectoryWindowFrames
-  )
-
-  return {
-    startFrame,
-    trajectory
-  }
-}
-
-function createDisappearanceExtension(
-  disappearingFace: Face,
-  disappearanceSampleIndex: number,
-  nextFrame: number,
-  samples: FaceSample[],
-  lookaheadFrames: number,
-  trajectoryWindowFrames: number
-) {
-  if (lookaheadFrames <= 0) {
-    return null
-  }
-
-  const disappearanceFrame = samples[disappearanceSampleIndex]!.frameIndex
-  const endFrame = Math.min(nextFrame - 1, disappearanceFrame + lookaheadFrames)
-
-  if (endFrame <= disappearanceFrame) {
-    return null
-  }
-
-  const trajectory = collectTrajectoryPoints(
-    samples,
-    disappearanceSampleIndex,
-    disappearingFace,
-    'backward',
-    trajectoryWindowFrames
-  )
-
-  return {
-    endFrame,
-    trajectory
-  }
+export interface FaceResolverOptions {
+  gapFrames?: number
+  appearanceFrames?: number
+  disappearanceFrames?: number
 }
 
 export function createFaceResolver(samples: FaceSample[], options: FaceResolverOptions = {}) {
   if (samples.length === 0) {
-    return () => [] as Face[]
+    return () => [] as ResolvedFace[]
   }
 
-  const normalizedSamples = [...samples].sort((left, right) => left.frameIndex - right.frameIndex)
-  const segments: FaceSegment[] = []
-  const appearanceLookbackFrames = Math.max(0, options.appearanceLookbackFrames ?? 0)
-  const disappearanceLookaheadFrames = Math.max(0, options.disappearanceLookaheadFrames ?? 0)
-  const trajectoryWindowFrames = Math.max(0, options.trajectoryWindowFrames ?? 0)
+  const normalized = [...samples].sort((left, right) => left.frameIndex - right.frameIndex)
+  const frameCount = normalized[normalized.length - 1]!.frameIndex + 1
+  let frameWidth = 0
+  let frameHeight = 0
+  for (const sample of normalized) {
+    for (const face of sample.faces) {
+      frameWidth = Math.max(frameWidth, face.x + face.width)
+      frameHeight = Math.max(frameHeight, face.y + face.height)
+    }
+  }
+  const gapFrames = Math.max(0, options.gapFrames ?? 4)
+  const appearanceFrames = Math.max(0, options.appearanceFrames ?? 0)
+  const disappearanceFrames = Math.max(0, options.disappearanceFrames ?? 0)
+  const tracks = mergeTracks(
+    removeIsolatedTracks(buildTracks(normalized), normalized, 2),
+    gapFrames
+  )
+  const globalMotion = estimateGlobalMotion(tracks)
+  const resolvedFrames = new Map<number, ResolvedFace[]>()
 
-  for (let index = 0; index < normalizedSamples.length - 1; index += 1) {
-    const currentSample = normalizedSamples[index]!
-    const nextSample = normalizedSamples[index + 1]!
-    const pairs = matchFaces(currentSample.faces, nextSample.faces).map((pair) => {
-      if (!pair.from && pair.to) {
-        return {
-          ...pair,
-          appearanceExtension: createAppearanceExtension(
-            pair.to,
-            index + 1,
-            currentSample.frameIndex,
-            normalizedSamples,
-            appearanceLookbackFrames,
-            trajectoryWindowFrames
-          ),
-          disappearanceExtension: null
-        }
-      }
+  for (const track of tracks) {
+    const unstable = trackIsUnstable(track)
+    smoothTrack(track, 5, !unstable)
+    for (const detection of track.detections) {
+      pushFace(resolvedFrames, detection.frameIndex, detection.face, 'detection')
+    }
+    fillTrackGaps(track, gapFrames, resolvedFrames)
+    fillTrackExtension(track, {
+      appearanceFrames,
+      disappearanceFrames,
+      frameCount
+    }, resolvedFrames, globalMotion, frameWidth, frameHeight)
+  }
 
-      if (pair.from && !pair.to) {
-        return {
-          ...pair,
-          appearanceExtension: null,
-          disappearanceExtension: createDisappearanceExtension(
-            pair.from,
-            index,
-            nextSample.frameIndex,
-            normalizedSamples,
-            disappearanceLookaheadFrames,
-            trajectoryWindowFrames
-          )
-        }
-      }
-
-      return {
-        ...pair,
-        appearanceExtension: null,
-        disappearanceExtension: null
-      }
-    })
-
-    segments.push({
-      startFrame: currentSample.frameIndex,
-      endFrame: nextSample.frameIndex,
-      pairs
-    })
+  for (const [frameIndex, faces] of resolvedFrames) {
+    resolvedFrames.set(frameIndex, deduplicateFrameFaces(faces))
   }
 
   return (frameIndex: number) => {
-    const firstSample = normalizedSamples[0]!
-    const lastSample = normalizedSamples[normalizedSamples.length - 1]!
-
-    if (frameIndex <= firstSample.frameIndex) {
-      return firstSample.faces.map(cloneFace)
-    }
-
-    if (frameIndex >= lastSample.frameIndex) {
-      return lastSample.faces.map(cloneFace)
-    }
-
-    const segment = segments.find(candidate => (
-      frameIndex >= candidate.startFrame && frameIndex <= candidate.endFrame
-    ))
-
-    if (!segment) {
-      return lastSample.faces.map(cloneFace)
-    }
-
-    const span = Math.max(1, segment.endFrame - segment.startFrame)
-    const t = (frameIndex - segment.startFrame) / span
-
-    return segment.pairs.flatMap((pair) => {
-      if (pair.from && pair.to) {
-        return [interpolateFace(pair.from, pair.to, t)]
-      }
-
-      if (
-        pair.from
-        && pair.disappearanceExtension
-        && frameIndex >= segment.startFrame
-        && frameIndex <= pair.disappearanceExtension.endFrame
-      ) {
-        return [
-          projectFaceFromPoints(
-            pair.disappearanceExtension.trajectory,
-            frameIndex,
-            pair.from
-          )
-        ]
-      }
-
-      if (
-        pair.to
-        && pair.appearanceExtension
-        && frameIndex >= pair.appearanceExtension.startFrame
-        && frameIndex < segment.endFrame
-      ) {
-        return [
-          projectFaceFromPoints(
-            pair.appearanceExtension.trajectory,
-            frameIndex,
-            pair.to
-          )
-        ]
-      }
-
-      if (pair.to && frameIndex >= segment.endFrame) {
-        return [cloneFace(pair.to)]
-      }
-
+    if (frameIndex < 0 || frameIndex >= frameCount) {
       return []
-    })
+    }
+
+    return resolvedFrames.get(frameIndex) ?? []
   }
 }

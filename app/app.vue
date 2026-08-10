@@ -18,6 +18,14 @@ useSeoMeta({
   ogDescription: description,
   twitterCard: 'summary_large_image'
 })
+
+onMounted(() => {
+  if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {
+      // Service worker availability is best-effort.
+    })
+  }
+})
 </script>
 
 <template>

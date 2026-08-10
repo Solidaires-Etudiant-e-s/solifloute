@@ -1,10 +1,17 @@
 import sharp from 'sharp'
-import type { DetectionInput, ProcessImagePayload } from '~~/shared/types/faces'
+import type { DetectionInput, DetectionModel, ProcessImagePayload } from '~~/shared/types/faces'
 import { applyBlurEffects } from '~~/shared/utils/imageProcessing'
+import { DETECTION_MODELS, getServerModelPath } from '~~/shared/utils/detectionModels'
 import { useFaceDetector } from '~~/shared/utils/useFaceDetector'
 
-const SERVER_MODEL_PATH = `${process.cwd()}/public/models/version-RFB-640.onnx`
-const detector = useFaceDetector(SERVER_MODEL_PATH)
+const MAX_IMAGE_PAYLOAD_BYTES = Number(process.env.PROCESS_MAX_IMAGE_PAYLOAD_BYTES || 80 * 1024 * 1024)
+
+function getDetector(detectionModel: DetectionModel) {
+  return useFaceDetector(
+    getServerModelPath(detectionModel),
+    DETECTION_MODELS[detectionModel].modelType
+  )
+}
 
 async function decodeImage(imageBase64: string): Promise<DetectionInput> {
   const inputBuffer = Buffer.from(imageBase64, 'base64')
@@ -22,11 +29,13 @@ async function decodeImage(imageBase64: string): Promise<DetectionInput> {
 
 async function detectFaces(payload: ProcessImagePayload) {
   const image = await decodeImage(payload.imageBase64)
+  const detector = getDetector(payload.settings.detectionModel)
   return await detector.detectFaces(image, payload.settings.confidenceThreshold)
 }
 
 async function blurImage(payload: ProcessImagePayload) {
   const image = await decodeImage(payload.imageBase64)
+  const detector = getDetector(payload.settings.detectionModel)
   const result = await detector.detectFaces(image, payload.settings.confidenceThreshold)
   const allFaces = [...result.faces, ...(payload.manualFaces || [])]
 
@@ -49,6 +58,13 @@ export default defineEventHandler(async (event) => {
     throw createError({
       statusCode: 400,
       statusMessage: 'Une image encodee en base64 et des reglages sont requis.'
+    })
+  }
+
+  if (payload.imageBase64.length > MAX_IMAGE_PAYLOAD_BYTES) {
+    throw createError({
+      statusCode: 413,
+      statusMessage: 'L image depasse la taille maximale autorisee.'
     })
   }
 

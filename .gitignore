@@ -3,3 +3,8 @@ dist
 .nuxt
 .output
 .data
+
+# Local dev/debug artifacts
+masks-*.json
+people*.webm
+people-*.mp4

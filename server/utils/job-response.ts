@@ -1,4 +1,5 @@
 import type { ProcessingJob } from './video-jobs'
+import { getQueuePosition } from './video-jobs'
 
 export function serializeJob(job: ProcessingJob) {
   return {
@@ -11,6 +12,8 @@ export function serializeJob(job: ProcessingJob) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     durationMs: job.durationMs,
+    remainingMs: job.remainingMs,
+    queuePosition: getQueuePosition(job.id, job.ownerId),
     downloadUrl: job.outputPath ? `/api/process-jobs/${job.id}/download` : null
   }
 }

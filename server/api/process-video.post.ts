@@ -1,7 +1,11 @@
+import { rm, writeFile } from 'node:fs/promises'
 import type { EditorSettings } from '~~/shared/types/faces'
 import { getOrCreateClientId } from '../utils/job-client'
-import { processVideoToFile } from '../utils/process-video'
-import { cancelJob, completeJob, createJob, enqueueJob, failJob, updateJobProgress } from '../utils/video-jobs'
+import { createVideoJobWorkspace } from '../utils/process-video'
+import { createJob, removeJob } from '../utils/video-jobs'
+import { enqueueVideoJob } from '../utils/video-job-runner'
+
+const MAX_VIDEO_UPLOAD_BYTES = Number(process.env.PROCESS_MAX_VIDEO_UPLOAD_BYTES || 1024 * 1024 * 1024)
 
 interface MultipartField {
   name?: string
@@ -29,6 +33,16 @@ function readSettingsField(value?: Buffer) {
 
 export default defineEventHandler(async (event) => {
   const ownerId = getOrCreateClientId(event)
+
+  const contentLength = Number(getRequestHeader(event, 'content-length') || 0)
+
+  if (contentLength > MAX_VIDEO_UPLOAD_BYTES) {
+    throw createError({
+      statusCode: 413,
+      statusMessage: 'Le fichier video depasse la taille maximale autorisee.'
+    })
+  }
+
   const parts = await readMultipartFormData(event)
 
   if (!parts?.length) {
@@ -48,45 +62,45 @@ export default defineEventHandler(async (event) => {
     })
   }
 
+  if (filePart.data.length > MAX_VIDEO_UPLOAD_BYTES) {
+    throw createError({
+      statusCode: 413,
+      statusMessage: 'Le fichier video depasse la taille maximale autorisee.'
+    })
+  }
+
   const settings = readSettingsField(settingsPart?.data)
+  const workspace = await createVideoJobWorkspace(filePart.filename)
   let jobId = ''
 
   try {
     jobId = createJob({
       ownerId,
       fileName: filePart.filename,
-      mimeType: 'video/mp4'
+      mimeType: 'video/mp4',
+      inputPath: workspace.inputPath,
+      settingsJson: JSON.stringify(settings),
+      tempRoot: workspace.tempRoot
     })
   } catch (error) {
+    await rm(workspace.tempRoot, { recursive: true, force: true })
     throw createError({
       statusCode: 429,
       statusMessage: error instanceof Error ? error.message : 'Trop de traitements video sont deja en attente.'
     })
   }
 
-  enqueueJob(jobId, async (signal) => {
-    const startedAt = Date.now()
+  try {
+    await writeFile(workspace.inputPath, filePart.data)
+  } catch {
+    await removeJob(jobId)
+    throw createError({
+      statusCode: 500,
+      statusMessage: 'Impossible de stocker le fichier video.'
+    })
+  }
 
-    try {
-      const { outputPath, tempRoot } = await processVideoToFile(filePart.data!, filePart.filename!, settings, (progress) => {
-        updateJobProgress(jobId, progress)
-      }, signal)
-
-      completeJob(jobId, {
-        outputPath,
-        tempRoot,
-        durationMs: Date.now() - startedAt,
-        mimeType: 'video/mp4'
-      })
-    } catch (error) {
-      if (signal.aborted) {
-        await cancelJob(jobId)
-        return
-      }
-
-      await failJob(jobId, error instanceof Error ? error.message : 'Le traitement de la video a echoue.')
-    }
-  })
+  enqueueVideoJob(jobId)
 
   return { jobId }
 })

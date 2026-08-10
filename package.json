@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "nuxt build",
+    "deploy": "bash scripts/deploy.sh",
     "dev": "nuxt dev",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare",
@@ -11,6 +12,7 @@
     "typecheck": "nuxt typecheck"
   },
   "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "@nuxt/ui": "^4.2.1",
@@ -21,6 +23,7 @@
   },
   "devDependencies": {
     "@iconify-json/lucide": "^1.2.105",
+    "@iconify-json/mingcute": "^1.2.8",
     "@iconify-json/ph": "^1.2.2",
     "@nuxt/eslint": "^1.10.0",
     "eslint": "^9.39.1",
