@@ -21,6 +21,7 @@ export interface JobRow {
   temp_root: string
   input_path: string
   settings_json: string
+  resume_count: number
 }
 
 interface SqliteStatement {
@@ -83,10 +84,17 @@ export function getJobDb() {
         output_path TEXT NOT NULL DEFAULT '',
         temp_root TEXT NOT NULL DEFAULT '',
         input_path TEXT NOT NULL DEFAULT '',
-        settings_json TEXT NOT NULL DEFAULT '{}'
+        settings_json TEXT NOT NULL DEFAULT '{}',
+        resume_count INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_jobs_owner_created ON jobs(owner_id, created_at DESC);
     `)
+
+    const columns = db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>
+
+    if (!columns.some(column => column.name === 'resume_count')) {
+      db.exec('ALTER TABLE jobs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0')
+    }
   }
 
   return db
@@ -96,8 +104,8 @@ export function upsertJobRow(row: JobRow) {
   getJobDb().prepare(`
     INSERT INTO jobs (
       id, owner_id, kind, file_name, mime_type, status, progress, error,
-      created_at, updated_at, duration_ms, output_path, temp_root, input_path, settings_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      created_at, updated_at, duration_ms, output_path, temp_root, input_path, settings_json, resume_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       owner_id = excluded.owner_id,
       kind = excluded.kind,
@@ -111,7 +119,8 @@ export function upsertJobRow(row: JobRow) {
       output_path = excluded.output_path,
       temp_root = excluded.temp_root,
       input_path = excluded.input_path,
-      settings_json = excluded.settings_json
+      settings_json = excluded.settings_json,
+      resume_count = excluded.resume_count
   `).run(
     row.id,
     row.owner_id,
@@ -127,7 +136,8 @@ export function upsertJobRow(row: JobRow) {
     row.output_path,
     row.temp_root,
     row.input_path,
-    row.settings_json
+    row.settings_json,
+    row.resume_count
   )
 }
 

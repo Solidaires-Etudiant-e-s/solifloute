@@ -22,28 +22,36 @@ function intersectionOverUnion(a: BoxCandidate, b: BoxCandidate) {
 }
 
 export function hardNonMaxSuppression(boxes: BoxCandidate[], iouThreshold = 0.3, topK = -1) {
-  const sorted = [...boxes].sort((a, b) => b.score - a.score)
-  const selected: BoxCandidate[] = []
+  const order = boxes
+    .map((box, index) => ({ box, index }))
+    .sort((a, b) => b.box.score - a.box.score)
+    .map(entry => entry.index)
+  const selected: number[] = []
+  const suppressed = new Uint8Array(boxes.length)
 
-  while (sorted.length > 0) {
-    const candidate = sorted.shift()
+  for (let orderIndex = 0; orderIndex < order.length; orderIndex += 1) {
+    const currentIndex = order[orderIndex]!
 
-    if (!candidate) {
+    if (suppressed[currentIndex]) {
       continue
     }
 
-    selected.push(candidate)
+    selected.push(currentIndex)
 
     if (topK > 0 && selected.length >= topK) {
       break
     }
 
-    for (let index = sorted.length - 1; index >= 0; index -= 1) {
-      if (intersectionOverUnion(candidate, sorted[index]!) > iouThreshold) {
-        sorted.splice(index, 1)
+    const current = boxes[currentIndex]!
+
+    for (let otherOrderIndex = orderIndex + 1; otherOrderIndex < order.length; otherOrderIndex += 1) {
+      const otherIndex = order[otherOrderIndex]!
+
+      if (!suppressed[otherIndex] && intersectionOverUnion(current, boxes[otherIndex]!) > iouThreshold) {
+        suppressed[otherIndex] = 1
       }
     }
   }
 
-  return selected
+  return selected.map(index => boxes[index]!)
 }

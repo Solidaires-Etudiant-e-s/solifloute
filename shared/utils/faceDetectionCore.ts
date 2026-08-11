@@ -7,7 +7,8 @@ export const NMS_THRESHOLD = 0.3
 
 const CENTER_FACE_STRIDE = 4
 const YU_NET_STRIDES = [8, 16, 32] as const
-const YU_NET_TOP_K = 5000
+export const MIN_PROBABILITY_THRESHOLD = 0.1
+export const MAX_CANDIDATES = 5000
 
 interface TensorOutput {
   data: unknown
@@ -77,12 +78,13 @@ function decodeCenterFaceOutputs(
   const featureWidth = Math.floor(width / CENTER_FACE_STRIDE)
   const featureHeight = Math.floor(height / CENTER_FACE_STRIDE)
   const featureCount = featureWidth * featureHeight
+  const threshold = Math.max(probabilityThreshold, MIN_PROBABILITY_THRESHOLD)
   const candidates: DetectionCandidate[] = []
 
   for (let index = 0; index < featureCount; index += 1) {
     const score = readFloat(heatmap, index)
 
-    if (score < probabilityThreshold) {
+    if (score < threshold) {
       continue
     }
 
@@ -105,8 +107,9 @@ function decodeCenterFaceOutputs(
   }
 
   candidates.sort((left, right) => right.score - left.score)
+  candidates.length = Math.min(candidates.length, MAX_CANDIDATES)
 
-  return hardNonMaxSuppression(candidates, NMS_THRESHOLD)
+  return hardNonMaxSuppression(candidates, NMS_THRESHOLD, MAX_CANDIDATES)
 }
 
 function mapFaces(candidates: ReturnType<typeof hardNonMaxSuppression>, sourceWidth: number, sourceHeight: number): Face[] {
@@ -148,6 +151,7 @@ function decodeYunetOutputs(
   probabilityThreshold: number
 ) {
   const candidates: DetectionCandidate[] = []
+  const threshold = Math.max(probabilityThreshold, MIN_PROBABILITY_THRESHOLD)
 
   for (const stride of YU_NET_STRIDES) {
     const cls = outputs[`cls_${stride}`]?.data as Float32Array | undefined
@@ -168,7 +172,7 @@ function decodeYunetOutputs(
         const objScore = clamp(readFloat(obj, index), 0, 1)
         const score = Math.sqrt(clsScore * objScore)
 
-        if (score < probabilityThreshold) {
+        if (score < threshold) {
           continue
         }
 
@@ -189,8 +193,9 @@ function decodeYunetOutputs(
   }
 
   candidates.sort((left, right) => right.score - left.score)
+  candidates.length = Math.min(candidates.length, MAX_CANDIDATES)
 
-  return hardNonMaxSuppression(candidates, NMS_THRESHOLD, YU_NET_TOP_K)
+  return hardNonMaxSuppression(candidates, NMS_THRESHOLD, MAX_CANDIDATES)
 }
 
 export function extractFacesFromYunetOutputs(

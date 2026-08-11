@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import type { EditorSettings } from '~~/shared/types/faces'
+import { MIN_PROBABILITY_THRESHOLD } from '~~/shared/utils/faceDetectionCore'
 import { processVideoFromPath } from './process-video'
 import {
   cancelJob,
@@ -9,6 +10,7 @@ import {
   getJob,
   listNonTerminalJobs,
   updateJobProgress,
+  JOB_RESUME_MAX,
   type ProcessingJob
 } from './video-jobs'
 
@@ -29,7 +31,7 @@ function parseStoredSettings(raw: string): EditorSettings {
 
     return {
       confidenceThreshold: typeof parsed.confidenceThreshold === 'number'
-        ? parsed.confidenceThreshold
+        ? Math.max(MIN_PROBABILITY_THRESHOLD, parsed.confidenceThreshold)
         : fallback.confidenceThreshold,
       blurIntensity: typeof parsed.blurIntensity === 'number'
         ? parsed.blurIntensity
@@ -98,6 +100,11 @@ export function enqueueVideoJob(jobId: string) {
 
 export function resumePendingJobs() {
   for (const job of listNonTerminalJobs()) {
+    if (job.resumeCount >= JOB_RESUME_MAX) {
+      void failJob(job.id, `Trop de tentatives de reprise automatique (${job.resumeCount}). Tache annulee.`)
+      continue
+    }
+
     enqueueJob(job.id, buildVideoTask(job))
   }
 }

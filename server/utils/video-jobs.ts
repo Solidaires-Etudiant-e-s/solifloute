@@ -28,6 +28,7 @@ export interface ProcessingJob {
   tempRoot: string
   inputPath: string
   settingsJson: string
+  resumeCount: number
 }
 
 const jobs = new Map<string, ProcessingJob>()
@@ -35,6 +36,8 @@ const queuedTasks = new Map<string, (signal: AbortSignal) => Promise<void>>()
 const activeControllers = new Map<string, AbortController>()
 const queue: string[] = []
 const JOB_TTL_MS = 24 * 60 * 60 * 1000
+export const JOB_RESUME_MAX = Math.max(1, Number(process.env.PROCESS_JOB_RESUME_MAX || 2))
+const JOB_TIMEOUT_MS = Number(process.env.PROCESS_JOB_TIMEOUT_MS || 2 * 60 * 60 * 1000)
 const JOB_QUEUE_CONCURRENCY = Math.max(1, Number(process.env.PROCESS_JOB_CONCURRENCY || 1))
 const JOB_QUEUE_LIMIT_PER_OWNER = Math.max(1, Number(process.env.PROCESS_JOB_LIMIT_PER_OWNER || 5))
 const PROGRESS_PERSIST_DELTA = 0.01
@@ -63,7 +66,8 @@ function toJobRow(job: ProcessingJob): JobRow {
     output_path: job.outputPath,
     temp_root: job.tempRoot,
     input_path: job.inputPath,
-    settings_json: job.settingsJson
+    settings_json: job.settingsJson,
+    resume_count: job.resumeCount
   }
 }
 
@@ -85,7 +89,8 @@ function fromJobRow(row: JobRow): ProcessingJob {
     outputPath: row.output_path,
     tempRoot: row.temp_root,
     inputPath: row.input_path,
-    settingsJson: row.settings_json
+    settingsJson: row.settings_json,
+    resumeCount: row.resume_count
   }
 }
 
@@ -111,6 +116,7 @@ function loadJobsFromStore() {
         job.status = 'queued'
         job.progress = 0
         job.error = ''
+        job.resumeCount += 1
         persistJob(job)
       }
 
@@ -140,6 +146,9 @@ async function runQueue() {
     activeTasks += 1
     job.status = 'processing'
     persistJob(job)
+    const jobTimeout = JOB_TIMEOUT_MS > 0
+      ? setTimeout(() => controller.abort(), JOB_TIMEOUT_MS)
+      : null
 
     void task(controller.signal)
       .catch(async (cause) => {
@@ -151,6 +160,9 @@ async function runQueue() {
         await failJob(jobId, cause instanceof Error ? cause.message : 'Le traitement a echoue.')
       })
       .finally(() => {
+        if (jobTimeout) {
+          clearTimeout(jobTimeout)
+        }
         activeControllers.delete(jobId)
         activeTasks = Math.max(0, activeTasks - 1)
         void runQueue()
@@ -194,7 +206,8 @@ export function createJob(input: {
     outputPath: '',
     tempRoot: input.tempRoot,
     inputPath: input.inputPath,
-    settingsJson: input.settingsJson
+    settingsJson: input.settingsJson,
+    resumeCount: 0
   }
 
   jobs.set(id, job)

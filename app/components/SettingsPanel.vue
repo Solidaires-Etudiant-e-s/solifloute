@@ -48,7 +48,7 @@ function normalizeSliderValue(value: number | number[]) {
 }
 
 const detectionSensitivity = computed({
-  get: () => Number((1 - settings.value.confidenceThreshold).toFixed(2)),
+  get: () => Number(Math.min(0.9, 1 - settings.value.confidenceThreshold).toFixed(2)),
   set: (value: number | number[]) => {
     const nextValue = normalizeSliderValue(value)
     settings.value.confidenceThreshold = Number((1 - nextValue).toFixed(2))
@@ -105,7 +105,7 @@ const detectionSensitivity = computed({
         <USlider
           v-model="detectionSensitivity"
           :min="0"
-          :max="1"
+          :max="0.9"
           :step="0.01"
         />
       </div>
