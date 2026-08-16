@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 import modal
-from fastapi import UploadFile
+from fastapi import File, Form, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 # Helper modules (processing.py, tracking.py, video.py) are baked into the image
@@ -80,7 +80,7 @@ image = (
 
 app = modal.App("solifloute-cloud", image=image)
 
-video_cache = modal.SharedVolume().persist("solifloute-video-cache")
+video_cache = modal.Volume.from_name("solifloute-video-cache", create_if_missing=True)
 
 
 def _settings_from_payload(payload: dict) -> dict:
@@ -137,7 +137,15 @@ class FaceProcessor:
         return JSONResponse(content={"videoId": video_id})
 
     @modal.fastapi_endpoint(method="POST")
-    def detect_faces(self, file: Optional[UploadFile] = None, settings: Optional[str] = "{}") -> JSONResponse:
+    def detect_faces(
+        self,
+        file: Optional[UploadFile] = File(None),
+        settings: Optional[str] = Form("{}"),
+        videoId: Optional[str] = Query(None),
+        startFrame: Optional[int] = Query(None),
+        endFrame: Optional[int] = Query(None),
+        gpuDecode: Optional[bool] = Query(None),
+    ) -> JSONResponse:
         payload = {}
         try:
             payload = json.loads(settings or "{}")
@@ -146,7 +154,7 @@ class FaceProcessor:
         conf = _settings_from_payload({"settings": payload})
         session = self._session(conf["model_path"])
 
-        video_id = payload.get("videoId")
+        video_id = payload.get("videoId") or videoId
         if video_id:
             input_path = _video_path_for(video_id)
         elif file is not None:
@@ -166,11 +174,11 @@ class FaceProcessor:
             except (TypeError, ValueError):
                 return fallback
 
-        start_frame = to_int(payload.get("startFrame"), 0)
-        end_frame = to_int(payload.get("endFrame"), -1)
+        start_frame = startFrame if startFrame is not None else to_int(payload.get("startFrame"), 0)
+        end_frame = endFrame if endFrame is not None else to_int(payload.get("endFrame"), -1)
         if end_frame < 0:
             end_frame = None
-        gpu_decode = bool(payload.get("gpuDecode", False))
+        gpu_decode = gpuDecode if gpuDecode is not None else bool(payload.get("gpuDecode", False))
 
         result = detect_faces_on_video(
             input_path,

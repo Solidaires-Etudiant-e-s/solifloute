@@ -129,6 +129,18 @@ async function postFormNoFile(
   settings: unknown,
   signal?: AbortSignal
 ): Promise<Response> {
+  const settingsObj = settings as Record<string, unknown>
+  const query = new URLSearchParams()
+
+  for (const key of ['videoId', 'startFrame', 'endFrame', 'gpuDecode']) {
+    const value = settingsObj[key]
+    if (value !== undefined && value !== null) {
+      query.append(key, String(value))
+    }
+  }
+
+  const queryString = query.toString()
+  const target = queryString ? `${url}${url.includes('?') ? '&' : '?'}${queryString}` : url
   const form = new FormData()
   form.append('settings', JSON.stringify(settings))
 
@@ -139,7 +151,7 @@ async function postFormNoFile(
 
   try {
     throwIfAborted(signal)
-    return await fetch(url, {
+    return await fetch(target, {
       method: 'POST',
       headers: modalHeaders(),
       body: form,
