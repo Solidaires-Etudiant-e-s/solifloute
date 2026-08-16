@@ -7,7 +7,21 @@ const settings = defineModel<EditorSettings>({ required: true })
 const props = defineProps<{
   activeMode: Exclude<ProcessingMode, 'auto'>
   serverOnly: boolean
+  showCloud: boolean
+  initialEstimatedMs: number | null
 }>()
+
+function formatEstimatedTime(estimatedMs: number) {
+  const totalSeconds = Math.max(1, Math.round(estimatedMs / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+
+  if (minutes === 0) {
+    return `~${seconds}s`
+  }
+
+  return `~${minutes} min ${String(seconds).padStart(2, '0')}s`
+}
 
 const modelItems = [
   { label: 'Rapide', icon: 'mingcute:flash-fill', value: 'fast' },
@@ -24,20 +38,31 @@ const detectionModel = computed({
 })
 
 const processingItems = computed(() => {
-  if (props.serverOnly) {
-    return [{ label: 'Serveur', icon: 'mingcute:server-line', value: 'server' }]
+  const items: Array<{ label: string, icon: string, value: 'client' | 'server' | 'cloud' }> = []
+
+  if (!props.serverOnly) {
+    items.push({ label: 'Navigateur', icon: 'mingcute:earth-line', value: 'client' })
   }
 
-  return [
-    { label: 'Navigateur', icon: 'mingcute:earth-line', value: 'client' },
-    { label: 'Serveur', icon: 'mingcute:server-line', value: 'server' }
-  ]
+  items.push({ label: 'Serveur', icon: 'mingcute:server-line', value: 'server' })
+
+  if (props.showCloud) {
+    items.push({ label: 'Cloud', icon: 'mingcute:cloud-line', value: 'cloud' })
+  }
+
+  return items
 })
+
+const isCloudMode = computed(() => props.activeMode === 'cloud')
 
 const processingMode = computed({
   get: () => props.activeMode,
   set: (value: string | number) => {
-    settings.value.processingMode = value === 'server' ? 'server' : 'client'
+    if (value === 'server' || value === 'cloud') {
+      settings.value.processingMode = value
+    } else {
+      settings.value.processingMode = 'client'
+    }
   }
 })
 
@@ -96,6 +121,22 @@ const detectionSensitivity = computed({
           variant="pill"
         />
       </UFormField>
+
+      <p
+        v-if="initialEstimatedMs !== null"
+        class="text-sm text-(--ui-text-dimmed)"
+      >
+        Temps de traitement estimé : {{ formatEstimatedTime(initialEstimatedMs) }}
+      </p>
+
+      <UAlert
+        v-if="isCloudMode"
+        color="primary"
+        variant="soft"
+        title="Traitement Cloud via Modal"
+        icon="mingcute:cloud-line"
+        description="Votre vidéo est transmise et traitée auprès d'un service externe. Bien que celui-ci assure une politique de non-rétention des données, le mode cloud est à éviter pour les vidéos extrêmement sensibles."
+      />
 
       <div class="space-y-2">
         <div class="flex items-center justify-between text-sm">

@@ -4,6 +4,13 @@ dist
 .output
 .data
 
+# Secrets
+.env
+
+# Python (Modal cloud worker) cache
+__pycache__/
+*.pyc
+
 # Local dev/debug artifacts
 masks-*.json
 people*.webm

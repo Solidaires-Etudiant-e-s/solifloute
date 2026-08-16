@@ -1,14 +1,16 @@
 import { join } from 'node:path'
 import type { EditorSettings } from '~~/shared/types/faces'
 import { MIN_PROBABILITY_THRESHOLD } from '~~/shared/utils/faceDetectionCore'
-import { processVideoFromPath } from './process-video'
+import { processVideoFromPath, processVideoWithCloudDetection } from './process-video'
 import {
   cancelJob,
   completeJob,
   enqueueJob,
   failJob,
   getJob,
+  isJobPreempted,
   listNonTerminalJobs,
+  requeueJob,
   updateJobProgress,
   JOB_RESUME_MAX,
   type ProcessingJob
@@ -36,7 +38,7 @@ function parseStoredSettings(raw: string): EditorSettings {
       blurIntensity: typeof parsed.blurIntensity === 'number'
         ? parsed.blurIntensity
         : fallback.blurIntensity,
-      processingMode: parsed.processingMode === 'client' || parsed.processingMode === 'server'
+      processingMode: parsed.processingMode === 'client' || parsed.processingMode === 'server' || parsed.processingMode === 'cloud'
         ? parsed.processingMode
         : fallback.processingMode,
       excludedFaceIds: Array.isArray(parsed.excludedFaceIds)
@@ -64,11 +66,14 @@ function buildVideoTask(job: ProcessingJob) {
     const startedAt = Date.now()
 
     try {
-      const { outputPath, tempRoot } = await processVideoFromPath(
+      const processor = settings.processingMode === 'cloud'
+        ? processVideoWithCloudDetection
+        : processVideoFromPath
+      const { outputPath, tempRoot } = await processor(
         workspace,
         settings,
-        (progress, remainingMs) => {
-          updateJobProgress(job.id, progress, remainingMs)
+        (progress, remainingMs, message) => {
+          updateJobProgress(job.id, progress, remainingMs, message)
         },
         signal
       )
@@ -81,7 +86,17 @@ function buildVideoTask(job: ProcessingJob) {
       })
     } catch (error) {
       if (signal.aborted) {
-        await cancelJob(job.id)
+        if (isJobPreempted(job.id)) {
+          if (job.resumeCount >= JOB_RESUME_MAX) {
+            await failJob(job.id, `Trop de reprises automatiques (${job.resumeCount}). Tache annulee.`)
+          } else {
+            requeueJob(job.id, buildVideoTask(job))
+          }
+        } else if (job.timedOut) {
+          await failJob(job.id, 'Le temps maximal de traitement est depasse. Tache interrompue.')
+        } else {
+          await cancelJob(job.id)
+        }
         return
       }
 

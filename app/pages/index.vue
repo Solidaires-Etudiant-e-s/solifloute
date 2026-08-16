@@ -3,10 +3,6 @@ const inputRef = ref<HTMLInputElement | null>(null)
 const editor = useImageEditor()
 const entries = computed(() => editor.uploadEntries.value)
 
-function formatMode(mode: 'client' | 'server') {
-  return mode === 'client' ? 'dans le navigateur' : 'sur le serveur'
-}
-
 function formatRemainingTime(remainingMs: number | null) {
   if (remainingMs === null) {
     return ''
@@ -140,40 +136,37 @@ function isCurrentEntry(entryId: string) {
       </template>
     </UModal>
 
-    <section class="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-      <div class="border border-default bg-muted pt-8 p-6">
-        <h1 class="max-w-3xl text-5xl leading-none sm:text-6xl">
-          SoliFloute
-        </h1>
-        <p class="mt-4 max-w-2xl text-lg text-muted">
-          Les vidéos sont conservées un maximum de 24 heures. Le traitement est effectué directement dans votre navigateur ou sur notre serveur, selon votre choix. Aucune donnée n'est collectée ou partagée.
-        </p>
+    <section class="border border-default bg-muted pt-8 p-6">
+      <div class="grid gap-6 lg:grid-cols-2 lg:items-center">
+        <div class="flex flex-col items-start gap-6">
+          <h1 class="text-5xl leading-none sm:text-6xl">
+            SoliFloute
+          </h1>
 
-        <div class="mt-8 flex flex-wrap items-center gap-3">
-          <UButton
-            size="xl"
-            color="primary"
-            @click="openPicker"
-          >
-            Importer un media
-          </UButton>
+          <div class="flex flex-wrap items-center gap-3">
+            <UButton
+              size="xl"
+              color="primary"
+              @click="openPicker"
+            >
+              Importer un media
+            </UButton>
+          </div>
         </div>
 
-        <input
-          ref="inputRef"
-          type="file"
-          accept="image/*,video/*"
-          multiple
-          class="hidden"
-          @change="onFileChange"
-        >
+        <p class="max-w-2xl text-md text-muted">
+          Les vidéos sont conservées un maximum de 24 heures. Le traitement est effectué dans votre navigateur, sur notre serveur ou, si vous choisissez le Cloud, chez un fournisseur externe (Modal). Le navigateur et le serveur ne collectent et ne partagent aucune donnée.
+        </p>
       </div>
 
-      <SettingsPanel
-        v-model="editor.settings"
-        :active-mode="editor.activeMode.value"
-        :server-only="editor.serverOnly.value"
-      />
+      <input
+        ref="inputRef"
+        type="file"
+        accept="image/*,video/*"
+        multiple
+        class="hidden"
+        @change="onFileChange"
+      >
     </section>
 
     <section
@@ -215,7 +208,7 @@ function isCurrentEntry(entryId: string) {
             v-if="entry.mediaKind === 'image'"
             :src="entry.originalPreviewUrl"
             :faces="entry.faces"
-            :excluded-face-ids="isCurrentEntry(entry.id) ? editor.settings.excludedFaceIds : []"
+            :excluded-face-ids="entry.settings.excludedFaceIds"
             @toggle="(faceId) => isCurrentEntry(entry.id) && editor.toggleExcludedFace(faceId)"
             @create="(face) => isCurrentEntry(entry.id) && editor.addManualFace(face)"
           />
@@ -235,9 +228,7 @@ function isCurrentEntry(entryId: string) {
           </p>
 
           <p class="text-sm text-(--ui-text-muted)">
-            {{ entry.mediaKind === 'image'
-              ? 'Cliquez sur un cadre pour l exclure du floutage, ou tracez une zone manuelle directement sur l image.'
-              : `Le mode video traite les images une par une ${formatMode(editor.activeMode.value)}.` }}
+            {{ entry.mediaKind === 'image' ? 'Cliquez sur un cadre pour l exclure du floutage, ou tracez une zone manuelle directement sur l image.' : '' }}
           </p>
         </div>
       </UCard>
@@ -289,9 +280,18 @@ function isCurrentEntry(entryId: string) {
           </div>
         </template>
 
+        <SettingsPanel
+          v-if="entry.status !== 'processing'"
+          v-model="entry.settings"
+          :active-mode="editor.activeModeForEntry(entry.id)"
+          :server-only="editor.isEntryServerOnly(entry.id)"
+          :show-cloud="entry.mediaKind === 'video'"
+          :initial-estimated-ms="editor.entryInitialEstimates.get(entry.id) ?? null"
+        />
+
         <div
           v-if="entry.processedPreviewUrl"
-          class="space-y-4"
+          class="mt-4 space-y-4"
         >
           <img
             v-if="entry.mediaKind === 'image'"
@@ -348,15 +348,6 @@ function isCurrentEntry(entryId: string) {
           </div>
 
           <p
-            v-else
-            class="text-sm text-(--ui-text-muted)"
-          >
-            {{ entry.mediaKind === 'video'
-              ? `La video sera traitee ${formatMode(editor.activeMode.value)}.`
-              : `Le mode automatique choisit actuellement un traitement ${formatMode(editor.activeMode.value)}.` }}
-          </p>
-
-          <p
             v-if="entry.error"
             class="text-sm text-(--ui-text-toned)"
           >
@@ -365,7 +356,16 @@ function isCurrentEntry(entryId: string) {
 
           <div class="flex justify-center gap-3 pt-4">
             <UButton
-              v-if="entry.status !== 'detecting' && entry.status !== 'processing'"
+              v-if="entry.isUploading"
+              disabled
+              color="primary"
+              variant="soft"
+              :loading="true"
+            >
+              Envoi en cours...
+            </UButton>
+            <UButton
+              v-else-if="entry.status !== 'detecting' && entry.status !== 'processing'"
               color="primary"
               @click="editor.processEntry(entry.id)"
             >

@@ -7,7 +7,7 @@ export interface Face {
   confidence: number
 }
 
-export type ProcessingMode = 'auto' | 'client' | 'server'
+export type ProcessingMode = 'auto' | 'client' | 'server' | 'cloud'
 
 export type DetectionModel = 'fast' | 'advanced'
 

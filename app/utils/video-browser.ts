@@ -16,13 +16,31 @@ const FFMPEG_SELF_HOSTED_BASE = '/ffmpeg'
 const FFMPEG_CDN_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`
 const FFMPEG_LOAD_TIMEOUT_MS = 30_000
 const MAX_BROWSER_VIDEO_DURATION_SECONDS = 60
-const MAX_BROWSER_VIDEO_PIXELS = 1280 * 720
+const MAX_BROWSER_VIDEO_PIXELS = 1920 * 1080
+const MAX_BROWSER_PROCESSING_WIDTH = 1280
+const MAX_BROWSER_PROCESSING_HEIGHT = 720
 const MAX_BROWSER_VIDEO_FRAMES = 1800
-const FRAME_JPEG_QUALITY = 3
+const READ_METADATA_TIMEOUT_MS = 15_000
 const OUTPUT_JPEG_QUALITY = 0.9
 const DEBUG_PREFIX = '[solifloute:browser-video]'
 
 export { MAX_BROWSER_VIDEO_DURATION_SECONDS, MAX_BROWSER_VIDEO_PIXELS }
+
+export function getBrowserProcessingDimensions(width: number, height: number) {
+  if (width <= 0 || height <= 0) {
+    return { width, height }
+  }
+
+  const scale = Math.min(
+    1,
+    Math.min(MAX_BROWSER_PROCESSING_WIDTH / width, MAX_BROWSER_PROCESSING_HEIGHT / height)
+  )
+
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale))
+  }
+}
 
 export interface BrowserVideoProgress {
   progress: number
@@ -83,8 +101,8 @@ function normalizeErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) {
     const message = error.message
 
-    if (/quota|exceeded|allocate|out of memory|grow/i.test(message)) {
-      return 'Le navigateur n a pas assez de memoire pour traiter cette video. Utilisez le mode serveur.'
+    if (/quota|exceeded|allocate|out of memory|grow|no space|errno|fs error|enospc/i.test(message)) {
+      return 'Le navigateur n a pas assez de memoire ou d espace de stockage temporaire pour traiter cette video. Utilisez le mode serveur.'
     }
 
     if (/fetch|cors|network|timeout|expire/i.test(message)) {
@@ -187,63 +205,64 @@ export async function readVideoMetadata(file: File): Promise<{ duration: number,
   const sourceUrl = URL.createObjectURL(file)
 
   return await new Promise<{ duration: number, width: number, height: number }>((resolve, reject) => {
+    let settled = false
+    const timer = window.setTimeout(() => {
+      if (settled) {
+        return
+      }
+      settled = true
+      URL.revokeObjectURL(sourceUrl)
+      reject(new Error('La lecture des metadonnees video a expire.'))
+    }, READ_METADATA_TIMEOUT_MS)
+
     const video = document.createElement('video')
     video.preload = 'metadata'
     video.muted = true
     video.playsInline = true
-    video.onloadedmetadata = () => {
+
+    const cleanup = () => {
+      window.clearTimeout(timer)
       video.removeAttribute('src')
       video.load()
       URL.revokeObjectURL(sourceUrl)
+    }
+
+    video.onloadedmetadata = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+
+      const duration = Number.isFinite(video.duration) ? video.duration : 0
+      const width = video.videoWidth
+      const height = video.videoHeight
+
+      cleanup()
       resolve({
-        duration: Number.isFinite(video.duration) ? video.duration : 0,
-        width: video.videoWidth,
-        height: video.videoHeight
+        duration,
+        width,
+        height
       })
     }
+
     video.onerror = () => {
+      if (settled) {
+        return
+      }
+      settled = true
       const mediaErrorCode = video.error?.code
+      cleanup()
 
       if (mediaErrorCode === 3 || mediaErrorCode === 4) {
-        URL.revokeObjectURL(sourceUrl)
         reject(new Error('Ce navigateur ne peut pas decoder cette video (codec non supporte). Utilisez le mode serveur.'))
         return
       }
 
-      URL.revokeObjectURL(sourceUrl)
       reject(new Error('Impossible de lire la video selectionnee.'))
     }
+
     video.src = sourceUrl
   })
-}
-
-async function readFrameAsImageData(
-  ffmpeg: BrowserFFmpeg,
-  path: string,
-  width: number,
-  height: number
-) {
-  const fileData = await ffmpeg.readFile(path)
-  const bytes = fileData instanceof Uint8Array
-    ? fileData.slice()
-    : new TextEncoder().encode(fileData)
-  const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }))
-
-  try {
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const context = canvas.getContext('2d', { willReadFrequently: true })
-
-    if (!context) {
-      throw new Error('Le contexte canvas 2D est indisponible.')
-    }
-
-    context.drawImage(bitmap, 0, 0, width, height)
-    return context.getImageData(0, 0, width, height)
-  } finally {
-    bitmap.close()
-  }
 }
 
 async function writeCanvasToJpeg(
@@ -316,6 +335,72 @@ async function runFfmpeg(
   }
 }
 
+function seekVideoTo(video: HTMLVideoElement, time: number) {
+  const target = Number.isFinite(time) ? time : 0
+
+  if (Math.abs(video.currentTime - target) < 0.001) {
+    return Promise.resolve()
+  }
+
+  return new Promise<void>((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+      video.removeEventListener('seeked', finish)
+      resolve()
+    }
+
+    video.addEventListener('seeked', finish)
+    video.currentTime = target
+
+    // Hard ceiling: never let a slow/unrelated seek stall the whole pipeline.
+    // If 'seeked' does not fire (throttled tab, slow decode), resolve anyway
+    // so processing can move on to the next frame.
+    window.setTimeout(finish, 2000)
+  })
+}
+
+function probeVideoFps(video: HTMLVideoElement) {
+  return new Promise<number>((resolve) => {
+    const requestFrame = (video as HTMLVideoElement & {
+      requestVideoFrameCallback?: (callback: (now: number, metadata: unknown) => void) => number
+    }).requestVideoFrameCallback
+
+    if (typeof requestFrame !== 'function') {
+      resolve(30)
+      return
+    }
+
+    let frames = 0
+    const startedAt = performance.now()
+    let settled = false
+
+    const countFrame = () => {
+      if (settled) {
+        return
+      }
+      frames += 1
+      const elapsed = performance.now() - startedAt
+
+      if (elapsed >= 1200 || video.currentTime >= video.duration) {
+        settled = true
+        video.pause()
+        const seconds = Math.max(0.001, elapsed / 1000)
+        resolve(Math.max(1, Math.round(frames / seconds)))
+        return
+      }
+
+      requestFrame.call(video, countFrame as (now: number, metadata: unknown) => void)
+    }
+
+    requestFrame.call(video, countFrame as (now: number, metadata: unknown) => void)
+    void video.play()
+  })
+}
+
 export async function processVideoInBrowser(
   file: File,
   settings: EditorSettings,
@@ -325,8 +410,8 @@ export async function processVideoInBrowser(
     { frames: 1, weight: 0.08 },
     { frames: 1, weight: 0.12 },
     { frames: 0, weight: 0.5 },
-    { frames: 0, weight: 0.23 },
-    { frames: 1, weight: 0.07 }
+    { frames: 1, weight: 0.23 },
+    { frames: 0, weight: 0.07 }
   ])
   const emit = (report: AdaptiveProgressReport, message: string) => {
     reportProgress(onProgress, report.progress, message, report.remainingMs)
@@ -350,11 +435,6 @@ export async function processVideoInBrowser(
     throw new Error('Ce navigateur ne peut pas decoder cette video (codec non supporte). Utilisez le mode serveur.')
   }
 
-  const { ffmpeg, fetchFile: readUploadedFile } = await getBrowserFFmpeg((fraction, message) => {
-    emitDeps(fraction, message)
-  })
-  emitDeps(1, 'Dependances pretes. Analyse de la video.')
-
   if (metadata.duration > MAX_BROWSER_VIDEO_DURATION_SECONDS) {
     throw new Error('Cette video est trop longue pour le traitement navigateur. Utilisez le mode serveur.')
   }
@@ -363,8 +443,12 @@ export async function processVideoInBrowser(
     throw new Error('Cette resolution video est trop elevee pour le traitement navigateur. Utilisez le mode serveur.')
   }
 
+  const { ffmpeg, fetchFile: readUploadedFile } = await getBrowserFFmpeg((fraction, message) => {
+    emitDeps(fraction, message)
+  })
+  emitDeps(1, 'Dependances pretes. Analyse de la video.')
+
   const jobId = crypto.randomUUID().replaceAll('-', '')
-  const framesDir = `${jobId}/in`
   const outputFramesDir = `${jobId}/out`
   const inputName = `${jobId}-input.${file.name.split('.').pop() || 'mp4'}`
   const outputName = `${jobId}-output.mp4`
@@ -376,12 +460,14 @@ export async function processVideoInBrowser(
   })
 
   try {
+    debugLog('stage: creating ffmpeg dirs')
     await ffmpeg.createDir(jobId)
-    await ffmpeg.createDir(framesDir)
     await ffmpeg.createDir(outputFramesDir)
     emitDeps(0.5, 'Extraction des images de la video.')
+    debugLog('stage: writing input file')
     await ffmpeg.writeFile(inputName, await readUploadedFile(file))
 
+    debugLog('stage: warming up detector')
     await warmupDetector(
       getClientModelUrl(settings.detectionModel),
       DETECTION_MODELS[settings.detectionModel].modelType
@@ -392,130 +478,134 @@ export async function processVideoInBrowser(
     )
     emit(progressTracker.nextPhase(), 'Extraction des images de la video.')
 
-    const extractionErrors: string[] = []
-    const extractionExitCode = await runFfmpeg(
-      ffmpeg,
-      [
-        '-y',
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-i',
-        inputName,
-        '-q:v',
-        String(FRAME_JPEG_QUALITY),
-        '-f',
-        'image2',
-        `${framesDir}/frame-%05d.jpg`
-      ],
-      progress => emit(progressTracker.report(progress), 'Extraction des images de la video.'),
-      (type, message) => {
-        if (type === 'fferr' || message.includes('Error')) {
-          extractionErrors.push(message)
-          debugLog('ffmpeg extraction log', { type, message })
-        }
-      }
-    )
+    debugLog('stage: decoding source video')
+    const sourceUrl = URL.createObjectURL(file)
+    const video = document.createElement('video')
+    let frameWidth = 0
+    let frameHeight = 0
+    let fps = 30
+    let frameCount = 0
+    let sourceDuration = 0
+    video.preload = 'auto'
+    video.muted = true
+    video.playsInline = true
+    video.src = sourceUrl
 
-    if (extractionExitCode !== 0) {
-      const lastError = extractionErrors[extractionErrors.length - 1] || ''
+    const decodeCanvas = document.createElement('canvas')
+    const maybeDecodeContext = decodeCanvas.getContext('2d', { willReadFrequently: true })
 
-      if (/decoder|decode|codec|not implemented|unknown/i.test(lastError)) {
-        throw new Error('Le navigateur ne peut pas decoder ce format video (codec non supporte). Utilisez le mode serveur.')
-      }
-
-      throw new Error(`L extraction des images video du navigateur a echoue (code ${extractionExitCode}).`)
-    }
-
-    const frameEntries = await ffmpeg.listDir(framesDir)
-    const frameNames = frameEntries
-      .filter(entry => !entry.isDir && entry.name.endsWith('.jpg'))
-      .sort()
-    const frameCount = frameNames.length
-
-    if (frameCount <= 0) {
-      throw new Error('Aucune image video n a pu etre extraite.')
-    }
-
-    if (frameCount > MAX_BROWSER_VIDEO_FRAMES) {
-      throw new Error('Cette video contient trop d images pour le traitement navigateur. Utilisez le mode serveur.')
-    }
-
-    const fps = Math.max(1, frameCount / Math.max(0.001, metadata.duration))
-    debugLog('frames extracted', { frameCount, fps })
-
-    async function readFrame(frameIndex: number) {
-      return await readFrameAsImageData(
-        ffmpeg,
-        `${framesDir}/${frameNames[frameIndex]}`,
-        metadata.width,
-        metadata.height
-      )
-    }
-
-    async function detectFacesAtFrame(frameIndex: number) {
-      const imageData = await readFrame(frameIndex)
-      const result = await detectImageData(
-        imageData,
-        settings.confidenceThreshold,
-        getClientModelUrl(settings.detectionModel),
-        DETECTION_MODELS[settings.detectionModel].modelType
-      )
-      return result.faces
-    }
-
-    progressTracker.setFrames(frameCount)
-    const samples = await collectFaceSamples(
-      frameCount,
-      detectFacesAtFrame,
-      framesDone => emit(progressTracker.report(framesDone), 'Detection des visages dans la video.')
-    )
-    emit(progressTracker.nextPhase(), 'Floutage des images video.')
-    debugLog('face samples collected', { sampleCount: samples.length })
-    const resolveFaces = createVideoFaceResolver(samples, fps)
-
-    const previewCanvas = document.createElement('canvas')
-    previewCanvas.width = metadata.width
-    previewCanvas.height = metadata.height
-    const previewContext = previewCanvas.getContext('2d')
-
-    if (!previewContext) {
+    if (!maybeDecodeContext) {
       throw new Error('Le contexte canvas 2D est indisponible.')
     }
 
-    progressTracker.setFrames(frameCount)
+    const decodeContext = maybeDecodeContext
 
-    for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
-      if (frameIndex === 0 || frameIndex % 30 === 0) {
-        debugLog('processing frame batch', { frameIndex, frameCount })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        video.onloadedmetadata = () => resolve()
+        video.onerror = () => reject(new Error('Le navigateur ne peut pas decoder cette video (codec non supporte). Utilisez le mode serveur.'))
+      })
+      video.onloadedmetadata = null
+      video.onerror = null
+
+      const nativeWidth = video.videoWidth
+      const nativeHeight = video.videoHeight
+      sourceDuration = Number.isFinite(video.duration) ? video.duration : 0
+
+      if (nativeWidth <= 0 || nativeHeight <= 0 || sourceDuration <= 0) {
+        throw new Error('Ce navigateur ne peut pas decoder cette video. Utilisez le mode serveur.')
       }
 
-      const imageData = await readFrame(frameIndex)
-      const processedImageData = new ImageData(
-        blurVideoFrame(
-          {
-            data: imageData.data,
-            width: imageData.width,
-            height: imageData.height
-          },
-          settings,
-          resolveFaces,
-          frameIndex
-        ),
-        imageData.width,
-        imageData.height
-      )
+      const processingDimensions = getBrowserProcessingDimensions(nativeWidth, nativeHeight)
+      frameWidth = processingDimensions.width
+      frameHeight = processingDimensions.height
+      fps = await probeVideoFps(video)
+      frameCount = Math.max(1, Math.ceil(sourceDuration * fps))
 
-      previewContext.putImageData(processedImageData, 0, 0)
-      const frameName = `frame-${String(frameIndex + 1).padStart(5, '0')}.jpg`
-      await writeCanvasToJpeg(ffmpeg, previewCanvas, `${outputFramesDir}/${frameName}`, OUTPUT_JPEG_QUALITY)
-      await deleteFFmpegFile(ffmpeg, `${framesDir}/${frameNames[frameIndex]}`)
-      emit(progressTracker.report(frameIndex + 1), 'Floutage des images video.')
+      if (frameCount > MAX_BROWSER_VIDEO_FRAMES) {
+        throw new Error('Cette video contient trop d images pour le traitement navigateur. Utilisez le mode serveur.')
+      }
+
+      decodeCanvas.width = frameWidth
+      decodeCanvas.height = frameHeight
+
+      async function decodeFrameAtFrameIndex(frameIndex: number) {
+        const targetTime = Math.min(Math.max(0, sourceDuration - 0.01), frameIndex / fps)
+        await seekVideoTo(video, targetTime)
+        decodeContext.drawImage(video, 0, 0, frameWidth, frameHeight)
+        return decodeContext.getImageData(0, 0, frameWidth, frameHeight)
+      }
+
+      async function detectFacesAtFrame(frameIndex: number) {
+        const imageData = await decodeFrameAtFrameIndex(frameIndex)
+        const result = await detectImageData(
+          imageData,
+          settings.confidenceThreshold,
+          getClientModelUrl(settings.detectionModel),
+          DETECTION_MODELS[settings.detectionModel].modelType
+        )
+        return result.faces
+      }
+
+      progressTracker.setFrames(frameCount)
+      debugLog('stage: detecting faces', { frameCount })
+      const samples = await collectFaceSamples(
+        frameCount,
+        detectFacesAtFrame,
+        framesDone => emit(progressTracker.report(framesDone), 'Detection des visages dans la video.')
+      )
+      emit(progressTracker.nextPhase(), 'Floutage des images video.')
+      debugLog('face samples collected', { sampleCount: samples.length })
+      const resolveFaces = createVideoFaceResolver(samples, fps)
+
+      const previewCanvas = document.createElement('canvas')
+      previewCanvas.width = frameWidth
+      previewCanvas.height = frameHeight
+      const previewContext = previewCanvas.getContext('2d')
+
+      if (!previewContext) {
+        throw new Error('Le contexte canvas 2D est indisponible.')
+      }
+
+      progressTracker.setFrames(frameCount)
+      debugLog('stage: blurring frames', { frameCount })
+
+      for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+        if (frameIndex === 0 || frameIndex % 30 === 0) {
+          debugLog('processing frame batch', { frameIndex, frameCount })
+        }
+
+        const imageData = await decodeFrameAtFrameIndex(frameIndex)
+        const processedImageData = new ImageData(
+          blurVideoFrame(
+            {
+              data: imageData.data,
+              width: imageData.width,
+              height: imageData.height
+            },
+            settings,
+            resolveFaces,
+            frameIndex
+          ),
+          imageData.width,
+          imageData.height
+        )
+
+        previewContext.putImageData(processedImageData, 0, 0)
+        const frameName = `frame-${String(frameIndex + 1).padStart(5, '0')}.jpg`
+        await writeCanvasToJpeg(ffmpeg, previewCanvas, `${outputFramesDir}/${frameName}`, OUTPUT_JPEG_QUALITY)
+        emit(progressTracker.report(frameIndex + 1), 'Floutage des images video.')
+      }
+    } finally {
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(sourceUrl)
     }
 
     debugLog('encoding output video')
     let lastLoggedEncodingBucket = -1
     emit(progressTracker.nextPhase(), 'Encodage de la video finale.')
+    debugLog('stage: encoding')
 
     const encodeExitCode = await runFfmpeg(
       ffmpeg,
@@ -607,13 +697,14 @@ export async function processVideoInBrowser(
     }
 
     const data = await ffmpeg.readFile(outputName)
+    debugLog('stage: read output', { bytes: data instanceof Uint8Array ? data.byteLength : null })
 
     if (!(data instanceof Uint8Array)) {
       throw new Error('L encodeur video du navigateur a renvoye un fichier invalide.')
     }
 
     debugLog('browser video processing completed', { bytes: data.byteLength })
-    emit(progressTracker.nextPhase(), 'Video traitee.')
+    reportProgress(onProgress, 1, 'Video traitee.', 0)
     return new Blob([data.slice()], { type: 'video/mp4' })
   } catch (error) {
     console.error(`${DEBUG_PREFIX} processing failed`, error)
@@ -622,7 +713,6 @@ export async function processVideoInBrowser(
     await deleteFFmpegFile(ffmpeg, inputName)
     await deleteFFmpegFile(ffmpeg, outputName)
     await deleteDirContents(ffmpeg, outputFramesDir)
-    await deleteDirContents(ffmpeg, framesDir)
     await ffmpeg.deleteDir(jobId).catch(() => {})
   }
 }

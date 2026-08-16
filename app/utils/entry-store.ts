@@ -1,4 +1,4 @@
-import type { Face } from '~~/shared/types/faces'
+import type { EditorSettings, Face } from '~~/shared/types/faces'
 
 export interface StoredEntry {
   id: string
@@ -11,6 +11,7 @@ export interface StoredEntry {
   warning: string
   lastDurationMs: number | null
   serverJobId: string | null
+  settings?: EditorSettings
   originalBlob: Blob
   processedBlob: Blob | null
 }

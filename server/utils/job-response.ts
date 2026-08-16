@@ -8,6 +8,7 @@ export function serializeJob(job: ProcessingJob) {
     status: job.status,
     fileName: job.fileName,
     progress: job.progress,
+    stage: job.stage,
     error: job.error,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,

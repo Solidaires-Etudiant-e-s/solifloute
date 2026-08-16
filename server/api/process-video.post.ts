@@ -1,8 +1,8 @@
 import { rm, writeFile } from 'node:fs/promises'
 import type { EditorSettings } from '~~/shared/types/faces'
 import { getOrCreateClientId } from '../utils/job-client'
-import { createVideoJobWorkspace } from '../utils/process-video'
-import { createJob, removeJob } from '../utils/video-jobs'
+import { createVideoJobWorkspace, getVideoFrameCount } from '../utils/process-video'
+import { createJob } from '../utils/video-jobs'
 import { enqueueVideoJob } from '../utils/video-job-runner'
 
 const MAX_VIDEO_UPLOAD_BYTES = Number(process.env.PROCESS_MAX_VIDEO_UPLOAD_BYTES || 1024 * 1024 * 1024)
@@ -35,6 +35,13 @@ export default defineEventHandler(async (event) => {
   const ownerId = getOrCreateClientId(event)
 
   const contentLength = Number(getRequestHeader(event, 'content-length') || 0)
+
+  if (contentLength <= 0) {
+    throw createError({
+      statusCode: 411,
+      statusMessage: 'La longueur du contenu est requise.'
+    })
+  }
 
   if (contentLength > MAX_VIDEO_UPLOAD_BYTES) {
     throw createError({
@@ -74,29 +81,32 @@ export default defineEventHandler(async (event) => {
   let jobId = ''
 
   try {
+    await writeFile(workspace.inputPath, filePart.data)
+  } catch {
+    await rm(workspace.tempRoot, { recursive: true, force: true })
+    throw createError({
+      statusCode: 500,
+      statusMessage: 'Impossible de stocker le fichier video.'
+    })
+  }
+
+  const frameCount = await getVideoFrameCount(workspace.inputPath)
+
+  try {
     jobId = createJob({
       ownerId,
       fileName: filePart.filename,
       mimeType: 'video/mp4',
       inputPath: workspace.inputPath,
       settingsJson: JSON.stringify(settings),
-      tempRoot: workspace.tempRoot
+      tempRoot: workspace.tempRoot,
+      frameCount
     })
   } catch (error) {
     await rm(workspace.tempRoot, { recursive: true, force: true })
     throw createError({
       statusCode: 429,
       statusMessage: error instanceof Error ? error.message : 'Trop de traitements video sont deja en attente.'
-    })
-  }
-
-  try {
-    await writeFile(workspace.inputPath, filePart.data)
-  } catch {
-    await removeJob(jobId)
-    throw createError({
-      statusCode: 500,
-      statusMessage: 'Impossible de stocker le fichier video.'
     })
   }
 

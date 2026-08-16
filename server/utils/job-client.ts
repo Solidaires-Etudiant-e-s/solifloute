@@ -21,7 +21,7 @@ export function getOrCreateClientId(event: H3Event) {
     path: '/',
     maxAge: CLIENT_COOKIE_MAX_AGE_SECONDS,
     sameSite: 'lax',
-    httpOnly: false
+    httpOnly: true
   })
 
   return nextValue

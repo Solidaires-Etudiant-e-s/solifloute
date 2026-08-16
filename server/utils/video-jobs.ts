@@ -19,6 +19,7 @@ export interface ProcessingJob {
   status: ProcessingJobStatus
   progress: number
   remainingMs: number | null
+  stage: string
   error: string
   createdAt: number
   updatedAt: number
@@ -28,6 +29,9 @@ export interface ProcessingJob {
   tempRoot: string
   inputPath: string
   settingsJson: string
+  frameCount: number | null
+  preempted: boolean
+  timedOut: boolean
   resumeCount: number
 }
 
@@ -40,11 +44,14 @@ export const JOB_RESUME_MAX = Math.max(1, Number(process.env.PROCESS_JOB_RESUME_
 const JOB_TIMEOUT_MS = Number(process.env.PROCESS_JOB_TIMEOUT_MS || 2 * 60 * 60 * 1000)
 const JOB_QUEUE_CONCURRENCY = Math.max(1, Number(process.env.PROCESS_JOB_CONCURRENCY || 1))
 const JOB_QUEUE_LIMIT_PER_OWNER = Math.max(1, Number(process.env.PROCESS_JOB_LIMIT_PER_OWNER || 5))
+const JOB_PREEMPTION_RATIO = Number(process.env.PROCESS_JOB_PREEMPTION_RATIO || 2)
+const JOB_PREEMPTION_ENABLED = process.env.PROCESS_JOB_PREEMPTION !== 'false'
+const JOB_PREEMPTION_MAX_PROGRESS = Number(process.env.PROCESS_JOB_PREEMPTION_MAX_PROGRESS || 0.95)
 const PROGRESS_PERSIST_DELTA = 0.01
 const PROGRESS_PERSIST_INTERVAL_MS = 2000
 let activeTasks = 0
-let lastProgressPersistAt = 0
-let lastProgressPersistValue = -1
+const progressPersist = new Map<string, { value: number, at: number }>()
+const preemptedBy = new Map<string, string>()
 
 function isTerminalStatus(status: ProcessingJobStatus) {
   return status === 'completed' || status === 'error' || status === 'cancelled'
@@ -81,6 +88,7 @@ function fromJobRow(row: JobRow): ProcessingJob {
     status: row.status as ProcessingJobStatus,
     progress: row.progress,
     remainingMs: null,
+    stage: '',
     error: row.error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -90,7 +98,10 @@ function fromJobRow(row: JobRow): ProcessingJob {
     tempRoot: row.temp_root,
     inputPath: row.input_path,
     settingsJson: row.settings_json,
-    resumeCount: row.resume_count
+    resumeCount: row.resume_count,
+    frameCount: null,
+    preempted: false,
+    timedOut: false
   }
 }
 
@@ -128,6 +139,89 @@ function loadJobsFromStore() {
   }
 }
 
+function parseJobMode(job: ProcessingJob) {
+  try {
+    return (JSON.parse(job.settingsJson) as { processingMode?: string }).processingMode ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function isCloudJob(job: ProcessingJob) {
+  return parseJobMode(job) === 'cloud'
+}
+
+function getJobCost(job: ProcessingJob) {
+  return job.frameCount != null && job.frameCount > 0 ? job.frameCount : null
+}
+
+function moveToQueueFront(jobId: string) {
+  const index = queue.indexOf(jobId)
+
+  if (index > 0) {
+    queue.splice(index, 1)
+    queue.unshift(jobId)
+  }
+}
+
+function maybePreempt(incomingId: string) {
+  if (!JOB_PREEMPTION_ENABLED || activeTasks < JOB_QUEUE_CONCURRENCY) {
+    return
+  }
+
+  const incoming = jobs.get(incomingId)
+
+  if (!incoming || incoming.status === 'processing' || isCloudJob(incoming)) {
+    return
+  }
+
+  const incomingCost = getJobCost(incoming)
+
+  if (incomingCost == null) {
+    return
+  }
+
+  let bestRunningId: string | null = null
+  let bestRunningCost = -1
+  let bestRunningController: AbortController | null = null
+
+  for (const [runningId, controller] of activeControllers) {
+    const running = jobs.get(runningId)
+
+    if (!running || running.preempted || isCloudJob(running)) {
+      continue
+    }
+
+    const runningCost = getJobCost(running)
+
+    if (runningCost == null || incomingCost * JOB_PREEMPTION_RATIO > runningCost) {
+      continue
+    }
+
+    if (running.progress >= JOB_PREEMPTION_MAX_PROGRESS) {
+      continue
+    }
+
+    if (runningCost > bestRunningCost) {
+      bestRunningCost = runningCost
+      bestRunningId = runningId
+      bestRunningController = controller
+    }
+  }
+
+  if (!bestRunningId) {
+    return
+  }
+
+  moveToQueueFront(incomingId)
+  const running = jobs.get(bestRunningId)!
+
+  running.preempted = true
+  running.resumeCount += 1
+  preemptedBy.set(bestRunningId, incomingId)
+  bestRunningController?.abort()
+}
+
 async function runQueue() {
   while (activeTasks < JOB_QUEUE_CONCURRENCY && queue.length > 0) {
     const jobId = queue[0]
@@ -147,7 +241,14 @@ async function runQueue() {
     job.status = 'processing'
     persistJob(job)
     const jobTimeout = JOB_TIMEOUT_MS > 0
-      ? setTimeout(() => controller.abort(), JOB_TIMEOUT_MS)
+      ? setTimeout(() => {
+          controller.abort()
+          const running = jobs.get(jobId)
+
+          if (running) {
+            running.timedOut = true
+          }
+        }, JOB_TIMEOUT_MS)
       : null
 
     void task(controller.signal)
@@ -163,6 +264,11 @@ async function runQueue() {
         if (jobTimeout) {
           clearTimeout(jobTimeout)
         }
+        const finished = jobs.get(jobId)
+
+        if (finished) {
+          finished.timedOut = false
+        }
         activeControllers.delete(jobId)
         activeTasks = Math.max(0, activeTasks - 1)
         void runQueue()
@@ -177,6 +283,7 @@ export function createJob(input: {
   inputPath: string
   settingsJson: string
   tempRoot: string
+  frameCount?: number | null
 }) {
   const activeOwnerJobs = [...jobs.values()].filter(job => (
     job.ownerId === input.ownerId
@@ -198,6 +305,7 @@ export function createJob(input: {
     status: 'queued',
     progress: 0,
     remainingMs: null,
+    stage: '',
     error: '',
     createdAt: now,
     updatedAt: now,
@@ -207,7 +315,10 @@ export function createJob(input: {
     tempRoot: input.tempRoot,
     inputPath: input.inputPath,
     settingsJson: input.settingsJson,
-    resumeCount: 0
+    resumeCount: 0,
+    frameCount: input.frameCount ?? null,
+    preempted: false,
+    timedOut: false
   }
 
   jobs.set(id, job)
@@ -247,6 +358,40 @@ export function enqueueJob(jobId: string, task: (signal: AbortSignal) => Promise
   }
 
   void runQueue()
+  maybePreempt(jobId)
+}
+
+export function isJobPreempted(jobId: string) {
+  return jobs.get(jobId)?.preempted === true
+}
+
+export function requeueJob(jobId: string, task: (signal: AbortSignal) => Promise<void>) {
+  const job = jobs.get(jobId)
+
+  if (!job || job.status === 'cancelled') {
+    return
+  }
+
+  const anchorId = preemptedBy.get(jobId)
+  preemptedBy.delete(jobId)
+  job.preempted = false
+  job.status = 'queued'
+  queuedTasks.set(jobId, task)
+
+  const currentIndex = queue.indexOf(jobId)
+
+  if (currentIndex >= 0) {
+    queue.splice(currentIndex, 1)
+  }
+
+  if (anchorId && queue.includes(anchorId)) {
+    const anchorIndex = queue.indexOf(anchorId)
+    queue.splice(anchorIndex + 1, 0, jobId)
+  } else {
+    queue.unshift(jobId)
+  }
+
+  void runQueue()
 }
 
 export function getJob(jobId: string) {
@@ -269,7 +414,7 @@ export function listNonTerminalJobs() {
   return [...jobs.values()].filter(job => job.status === 'queued' || job.status === 'processing')
 }
 
-export function updateJobProgress(jobId: string, progress: number, remainingMs: number | null = null) {
+export function updateJobProgress(jobId: string, progress: number, remainingMs: number | null = null, message = '') {
   const job = jobs.get(jobId)
 
   if (!job) {
@@ -279,15 +424,20 @@ export function updateJobProgress(jobId: string, progress: number, remainingMs: 
   const nextProgress = Math.max(0, Math.min(1, progress))
   job.progress = nextProgress
   job.remainingMs = remainingMs
+
+  if (message) {
+    job.stage = message
+  }
+
   const now = Date.now()
+  const persisted = progressPersist.get(jobId)
 
   if (
     nextProgress >= 1
-    || nextProgress - lastProgressPersistValue >= PROGRESS_PERSIST_DELTA
-    || now - lastProgressPersistAt >= PROGRESS_PERSIST_INTERVAL_MS
+    || nextProgress - (persisted?.value ?? -1) >= PROGRESS_PERSIST_DELTA
+    || now - (persisted?.at ?? 0) >= PROGRESS_PERSIST_INTERVAL_MS
   ) {
-    lastProgressPersistValue = nextProgress
-    lastProgressPersistAt = now
+    progressPersist.set(jobId, { value: nextProgress, at: now })
     persistJob(job)
   }
 }
@@ -383,6 +533,7 @@ export async function removeJob(jobId: string) {
 
   activeControllers.delete(jobId)
   jobs.delete(jobId)
+  progressPersist.delete(jobId)
   deleteJobRow(jobId)
 
   if (job.tempRoot) {
@@ -466,6 +617,7 @@ export async function cleanupJob(jobId: string) {
   queuedTasks.delete(jobId)
   activeControllers.get(jobId)?.abort()
   activeControllers.delete(jobId)
+  progressPersist.delete(jobId)
   deleteJobRow(jobId)
 
   if (job.tempRoot) {

@@ -1,12 +1,15 @@
 import type { EditorSettings, Face, ProcessingMode } from '~~/shared/types/faces'
 import { applyBlurEffects } from '~~/shared/utils/imageProcessing'
 import { DETECTION_MODELS, getClientModelUrl } from '~~/shared/utils/detectionModels'
+import { estimateProcessingTimeMs } from '~~/shared/utils/estimatedProcessingTime'
 import { useFaceDetector } from '~~/shared/utils/useFaceDetector'
 import { fileToBase64, fileToImageData, imageDataToBlob, imageDataToDetectionInput } from '~/utils/image-io'
 import { detectImageData, processImageData } from '~/utils/detect-worker'
 import { inferProcessingTarget } from '~/utils/machine-profile'
+import { estimateClientVideoProcessingMs } from '~/utils/performance-probe'
 import { loadAllEntries, saveEntry, type StoredEntry } from '~/utils/entry-store'
 import {
+  getBrowserProcessingDimensions,
   MAX_BROWSER_VIDEO_DURATION_SECONDS,
   MAX_BROWSER_VIDEO_PIXELS,
   processVideoInBrowser,
@@ -44,6 +47,10 @@ interface UploadEntry {
   processingQueued: boolean
   estimatedRemainingMs: number | null
   serverJobId: string | null
+  settings: EditorSettings
+  autoResolvedMode: Exclude<ProcessingMode, 'auto'>
+  videoServerOnly: boolean
+  isUploading: boolean
 }
 
 interface DetectResponse {
@@ -56,6 +63,7 @@ interface VideoJobResponse {
   status: 'queued' | 'processing' | 'completed' | 'error' | 'cancelled'
   progress: number
   remainingMs: number | null
+  stage: string
   error: string
   queuePosition: number | null
   downloadUrl: string | null
@@ -109,7 +117,7 @@ function loadPersistedSettings(): Partial<EditorSettings> {
       blurIntensity: typeof parsed.blurIntensity === 'number'
         ? parsed.blurIntensity
         : DEFAULT_SETTINGS.blurIntensity,
-      processingMode: parsed.processingMode === 'client' || parsed.processingMode === 'server'
+      processingMode: parsed.processingMode === 'client' || parsed.processingMode === 'server' || parsed.processingMode === 'cloud'
         ? parsed.processingMode
         : DEFAULT_SETTINGS.processingMode,
       detectionModel: parsed.detectionModel === 'fast' || parsed.detectionModel === 'advanced'
@@ -138,6 +146,35 @@ function persistSettings(settings: Partial<EditorSettings>) {
   }
 }
 
+function sanitizeEntrySettings(raw?: Partial<EditorSettings>): EditorSettings {
+  const fallback = { ...DEFAULT_SETTINGS, ...loadPersistedSettings() }
+
+  if (!raw) {
+    return {
+      ...fallback,
+      excludedFaceIds: []
+    }
+  }
+
+  return {
+    confidenceThreshold: typeof raw.confidenceThreshold === 'number'
+      ? raw.confidenceThreshold
+      : fallback.confidenceThreshold,
+    blurIntensity: typeof raw.blurIntensity === 'number'
+      ? raw.blurIntensity
+      : fallback.blurIntensity,
+    processingMode: raw.processingMode === 'client' || raw.processingMode === 'server' || raw.processingMode === 'cloud'
+      ? raw.processingMode
+      : fallback.processingMode,
+    excludedFaceIds: Array.isArray(raw.excludedFaceIds)
+      ? raw.excludedFaceIds.filter(id => typeof id === 'string')
+      : [],
+    detectionModel: raw.detectionModel === 'fast' || raw.detectionModel === 'advanced'
+      ? raw.detectionModel
+      : fallback.detectionModel
+  }
+}
+
 export function useImageEditor() {
   const entryFiles = new Map<string, File>()
   const entryImageData = new Map<string, ImageData>()
@@ -145,28 +182,63 @@ export function useImageEditor() {
   const videoRunIds = new Map<string, number>()
   const detectRunIds = new Map<string, number>()
   const serverVideoJobIds = new Map<string, string>()
+  const entryInitialEstimates = reactive(new Map<string, number>())
+  const entryVideoMetadata = new Map<string, { duration: number, width: number, height: number, frameCount?: number, fps?: number }>()
 
   const file = shallowRef<File | null>(null)
   const originalImageData = shallowRef<ImageData | null>(null)
   const uploadEntries = ref<UploadEntry[]>([])
   const currentEntryId = ref<string | null>(null)
   const settings = reactive<EditorSettings>({ ...DEFAULT_SETTINGS, ...loadPersistedSettings() })
-  const autoResolvedMode = ref<Exclude<ProcessingMode, 'auto'>>('client')
-  const videoServerOnly = ref(false)
   const safariVideoModalOpen = ref(false)
   const isSafari = isSafariBrowser()
   const clientDetector = shallowRef<ReturnType<typeof useFaceDetector> | null>(null)
+  let clientDetectorModel: DetectionModel | null = null
 
-  function getClientDetector() {
+  function getEntrySettings(entryId: string): EditorSettings {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+    return entry?.settings ?? settings
+  }
+
+  function isEntryServerOnly(entryId: string) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+    return Boolean(entry && (entry.videoServerOnly || (isSafari && entry.mediaKind === 'video')))
+  }
+
+  function activeModeForEntry(entryId: string): Exclude<ProcessingMode, 'auto'> {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!entry) {
+      return 'server'
+    }
+
+    const requested = entry.settings.processingMode === 'auto' ? entry.autoResolvedMode : entry.settings.processingMode
+
+    // Cloud is a video-only target: never resolve it for images.
+    if (requested === 'cloud' && entry.mediaKind !== 'video') {
+      return 'server'
+    }
+
+    // serverOnly means the browser cannot process this entry: override auto /
+    // client choices, but keep an explicit Cloud selection (Cloud runs server-side).
+    if (isEntryServerOnly(entryId) && requested !== 'cloud') {
+      return 'server'
+    }
+
+    return requested
+  }
+
+  function getClientDetector(detectionModel: DetectionModel) {
     if (!import.meta.client) {
       return null
     }
 
-    if (!clientDetector.value) {
+    if (!clientDetector.value || clientDetectorModel !== detectionModel) {
       clientDetector.value = useFaceDetector(
-        getClientModelUrl(settings.detectionModel),
-        DETECTION_MODELS[settings.detectionModel].modelType
+        getClientModelUrl(detectionModel),
+        DETECTION_MODELS[detectionModel].modelType
       )
+      clientDetectorModel = detectionModel
     }
 
     return clientDetector.value
@@ -177,23 +249,6 @@ export function useImageEditor() {
       ? uploadEntries.value.find(entry => entry.id === currentEntryId.value) || null
       : null
   ))
-
-  const isSafariVideoForcedToServer = computed(() => (
-    isSafari
-    && mediaKind.value === 'video'
-  ))
-
-  const serverOnly = computed(() => (
-    isSafariVideoForcedToServer.value || videoServerOnly.value
-  ))
-
-  const activeMode = computed(() => {
-    if (serverOnly.value) {
-      return 'server'
-    }
-
-    return settings.processingMode === 'auto' ? autoResolvedMode.value : settings.processingMode
-  })
 
   const mediaKind = computed(() => currentEntry.value?.mediaKind ?? null)
   const faces = computed(() => currentEntry.value?.faces ?? [])
@@ -269,6 +324,13 @@ export function useImageEditor() {
       warning: entry.warning,
       lastDurationMs: entry.lastDurationMs,
       serverJobId: entry.serverJobId,
+      settings: {
+        confidenceThreshold: entry.settings.confidenceThreshold,
+        blurIntensity: entry.settings.blurIntensity,
+        processingMode: entry.settings.processingMode,
+        excludedFaceIds: [...entry.settings.excludedFaceIds],
+        detectionModel: entry.settings.detectionModel
+      },
       originalBlob: entryFile,
       processedBlob: entryProcessedBlobs.get(entryId) ?? null
     }
@@ -306,6 +368,132 @@ export function useImageEditor() {
     })
   }
 
+  async function fetchServerVideoMetadata(entryId: string): Promise<{ duration: number, width: number, height: number, frameCount?: number, fps?: number } | null> {
+    const entryFile = entryFiles.get(entryId)
+
+    if (!entryFile) {
+      return null
+    }
+
+    const form = new FormData()
+    form.append('file', entryFile)
+
+    updateEntry(entryId, { isUploading: true })
+
+    try {
+      const metadata = await $fetch<{ width: number, height: number, duration: number, fps: number, frameCount: number }>('/api/video-metadata', {
+        method: 'POST',
+        body: form
+      })
+
+      if (!metadata || metadata.width <= 0 || metadata.height <= 0 || metadata.duration <= 0) {
+        return null
+      }
+
+      return metadata
+    } catch (cause) {
+      console.debug('[solifloute] estimate: echec des metadonnees serveur', { entryId, cause: cause instanceof Error ? cause.message : String(cause) })
+      return null
+    } finally {
+      updateEntry(entryId, { isUploading: false })
+    }
+  }
+
+  async function setInitialVideoEstimate(entryId: string) {
+    const entryFile = entryFiles.get(entryId)
+
+    if (!import.meta.client || !entryFile) {
+      console.debug('[solifloute] estimate skipped: pas de client navigateur ou fichier introuvable', { entryId, hasFile: Boolean(entryFile) })
+      return
+    }
+
+    let metadata: { duration: number, width: number, height: number, frameCount?: number, fps?: number } | null | undefined = entryVideoMetadata.get(entryId)
+    let metadataSource: 'cache' | 'lecture' | 'serveur' = 'cache'
+
+    if (!metadata) {
+      metadataSource = 'lecture'
+      metadata = await readVideoMetadata(entryFile).catch((cause) => {
+        console.debug('[solifloute] estimate: echec lecture metadonnees video', { entryId, cause: cause instanceof Error ? cause.message : String(cause) })
+        return null
+      })
+    }
+
+    if (!metadata || metadata.width <= 0 || metadata.height <= 0 || metadata.duration <= 0) {
+      // Certaines videos (ex: messages WhatsApp) ne fournissent pas de
+      // metadonnees exploitables via l element <video> du navigateur.
+      // On interroge alors le serveur (ffprobe) pour obtenir de vraies valeurs.
+      console.debug('[solifloute] estimate: metadonnees navigateur inutilisables, fallback serveur', { entryId, metadata })
+      const serverMetadata = await fetchServerVideoMetadata(entryId)
+
+      if (!serverMetadata) {
+        console.debug('[solifloute] estimate: aucun temps calcule', { entryId })
+        return
+      }
+
+      metadata = serverMetadata
+      metadataSource = 'serveur'
+      entryVideoMetadata.set(entryId, serverMetadata)
+    }
+
+    console.debug('[solifloute] estimate: metadonnees video', { entryId, metadataSource, metadata })
+
+    const entrySettings = getEntrySettings(entryId)
+    const processingMode = activeModeForEntry(entryId)
+    let estimatedMs = 0
+
+    if (processingMode === 'client') {
+      const frameCount = metadata.frameCount && metadata.frameCount > 0
+        ? metadata.frameCount
+        : metadata.duration > 0
+          ? Math.max(1, Math.round(metadata.duration * 30))
+          : 0
+      const { width: processWidth, height: processHeight } = getBrowserProcessingDimensions(
+        metadata.width,
+        metadata.height
+      )
+      const clientMs = await estimateClientVideoProcessingMs(
+        entrySettings.detectionModel,
+        processWidth,
+        processHeight,
+        frameCount
+      )
+
+      if (clientMs !== null && clientMs > 0) {
+        estimatedMs = clientMs
+      }
+    }
+
+    if (estimatedMs <= 0) {
+      const result = estimateProcessingTimeMs({
+        processingMode,
+        detectionModel: entrySettings.detectionModel,
+        resolution: { width: metadata.width, height: metadata.height },
+        frameCount: metadata.frameCount,
+        durationSeconds: metadata.frameCount ? undefined : metadata.duration
+      })
+      estimatedMs = result.estimatedMs
+    }
+
+    console.debug('[solifloute] estimate: calcul', {
+      entryId,
+      processingMode,
+      detectionModel: entrySettings.detectionModel,
+      width: metadata.width,
+      height: metadata.height,
+      durationSeconds: metadata.duration,
+      frameCount: metadata.frameCount,
+      estimatedMs
+    })
+
+    if (estimatedMs > 0) {
+      entryInitialEstimates.set(entryId, estimatedMs)
+      console.debug('[solifloute] estimate: applique a l entree', {
+        entryId,
+        estimatedRemainingMs: uploadEntries.value.find(entry => entry.id === entryId)?.estimatedRemainingMs
+      })
+    }
+  }
+
   function getManualFaces(entryId: string) {
     return uploadEntries.value.find(entry => entry.id === entryId)?.faces.filter(isManualFace) ?? []
   }
@@ -318,13 +506,15 @@ export function useImageEditor() {
     void persistEntry(entryId)
   }
 
-  function createSettingsSnapshot(): EditorSettings {
+  function createSettingsSnapshot(entryId: string): EditorSettings {
+    const source = getEntrySettings(entryId)
+
     return {
-      confidenceThreshold: settings.confidenceThreshold,
-      blurIntensity: settings.blurIntensity,
-      processingMode: settings.processingMode,
-      excludedFaceIds: [...settings.excludedFaceIds],
-      detectionModel: settings.detectionModel
+      confidenceThreshold: source.confidenceThreshold,
+      blurIntensity: source.blurIntensity,
+      processingMode: source.processingMode,
+      excludedFaceIds: [...source.excludedFaceIds],
+      detectionModel: source.detectionModel
     }
   }
 
@@ -367,12 +557,13 @@ export function useImageEditor() {
 
     const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
     const facesToBlur = nextFaces.length > 0 ? nextFaces : (entry?.faces ?? [])
+    const entrySettings = getEntrySettings(entryId)
     const processedImageData = new ImageData(
       applyBlurEffects(
         imageDataToDetectionInput(imageData),
         facesToBlur,
-        settings.excludedFaceIds,
-        settings.blurIntensity
+        entrySettings.excludedFaceIds,
+        entrySettings.blurIntensity
       ),
       imageData.width,
       imageData.height
@@ -393,7 +584,8 @@ export function useImageEditor() {
 
   async function detectOnClientForEntry(entryId: string) {
     const imageData = await getEntryImageData(entryId)
-    const detector = getClientDetector()
+    const entrySettings = getEntrySettings(entryId)
+    const detector = getClientDetector(entrySettings.detectionModel)
 
     if (!imageData || !detector) {
       throw new Error('La detection des visages dans le navigateur est indisponible.')
@@ -401,12 +593,13 @@ export function useImageEditor() {
 
     return await detector.detectFaces(
       imageDataToDetectionInput(imageData),
-      settings.confidenceThreshold
+      entrySettings.confidenceThreshold
     )
   }
 
   async function detectInWorkerForEntry(entryId: string) {
     const imageData = await getEntryImageData(entryId)
+    const entrySettings = getEntrySettings(entryId)
 
     if (!imageData) {
       throw new Error('Aucune image n a ete chargee.')
@@ -415,9 +608,9 @@ export function useImageEditor() {
     try {
       const result = await detectImageData(
         imageData,
-        settings.confidenceThreshold,
-        getClientModelUrl(settings.detectionModel),
-        DETECTION_MODELS[settings.detectionModel].modelType
+        entrySettings.confidenceThreshold,
+        getClientModelUrl(entrySettings.detectionModel),
+        DETECTION_MODELS[entrySettings.detectionModel].modelType
       )
       return {
         faces: result.faces,
@@ -442,7 +635,7 @@ export function useImageEditor() {
         imageBase64: await fileToBase64(entryFile),
         fileName: entryFile.name,
         mimeType: entryFile.type,
-        settings: createSettingsSnapshot()
+        settings: createSettingsSnapshot(entryId)
       }
     })
   }
@@ -458,7 +651,7 @@ export function useImageEditor() {
     setEntryStatus(entryId, 'detecting')
 
     try {
-      const result = activeMode.value === 'server'
+      const result = activeModeForEntry(entryId) === 'server'
         ? await detectOnServerForEntry(entryId)
         : await detectInWorkerForEntry(entryId)
 
@@ -468,7 +661,7 @@ export function useImageEditor() {
 
       applyDetection(entryId, result)
 
-      if (activeMode.value === 'client') {
+      if (activeModeForEntry(entryId) === 'client') {
         await refreshClientPreviewForEntry(entryId)
       }
 
@@ -508,10 +701,10 @@ export function useImageEditor() {
     try {
       const response = await processImageData(
         imageData,
-        createSettingsSnapshot(),
+        createSettingsSnapshot(entryId),
         getManualFaces(entryId),
-        getClientModelUrl(settings.detectionModel),
-        DETECTION_MODELS[settings.detectionModel].modelType
+        getClientModelUrl(getEntrySettings(entryId).detectionModel),
+        DETECTION_MODELS[getEntrySettings(entryId).detectionModel].modelType
       )
 
       applyDetection(entryId, {
@@ -538,7 +731,7 @@ export function useImageEditor() {
         imageBase64: await fileToBase64(entryFile),
         fileName: entryFile.name,
         mimeType: entryFile.type,
-        settings: createSettingsSnapshot(),
+        settings: createSettingsSnapshot(entryId),
         manualFaces: getManualFaces(entryId)
       },
       responseType: 'blob'
@@ -561,12 +754,17 @@ export function useImageEditor() {
           processingMessage: job.queuePosition !== null
             ? `Video en attente dans la file (position ${job.queuePosition}).`
             : 'Video en attente dans la file.',
-          estimatedRemainingMs: null,
+          estimatedRemainingMs: entryInitialEstimates.get(entryId) ?? null,
           processingQueued: true
         })
       } else if (job.status === 'processing') {
         updateEntry(entryId, { processingQueued: false })
-        updateProgress(entryId, job.progress, 'Traitement video sur le serveur.', job.remainingMs)
+        updateProgress(
+          entryId,
+          job.progress,
+          job.stage || 'Traitement video sur le serveur.',
+          job.remainingMs
+        )
       }
 
       if (job.status === 'completed') {
@@ -605,6 +803,7 @@ export function useImageEditor() {
     serverVideoJobIds.set(entryId, jobId)
     setEntryStatus(entryId, 'processing')
     updateProgress(entryId, 0, 'Reprise du traitement video sur le serveur.')
+    await setInitialVideoEstimate(entryId)
 
     try {
       const blob = await pollServerVideoJob(entryId, jobId, runId)
@@ -635,6 +834,8 @@ export function useImageEditor() {
 
       if (runId === currentRunId(videoRunIds, entryId)) {
         serverVideoJobIds.delete(entryId)
+        entryInitialEstimates.delete(entryId)
+        entryVideoMetadata.delete(entryId)
         updateEntry(entryId, { processingQueued: false })
         updateProgress(entryId, null)
       }
@@ -653,14 +854,15 @@ export function useImageEditor() {
     const startedAt = Date.now()
     setEntryStatus(entryId, 'processing')
     updateProgress(entryId, 0, 'Preparation du traitement video.')
+    await setInitialVideoEstimate(entryId)
 
     try {
       let blob: Blob | null = null
 
-      if (activeMode.value === 'server') {
+      if (activeModeForEntry(entryId) === 'server' || activeModeForEntry(entryId) === 'cloud') {
         const body = new FormData()
         body.append('file', entryFile)
-        body.append('settings', JSON.stringify(createSettingsSnapshot()))
+        body.append('settings', JSON.stringify(createSettingsSnapshot(entryId)))
 
         const { jobId } = await $fetch<{ jobId: string }>('/api/process-video', {
           method: 'POST',
@@ -671,7 +873,7 @@ export function useImageEditor() {
         void persistEntry(entryId)
         blob = await pollServerVideoJob(entryId, jobId, runId)
       } else {
-        blob = await processVideoInBrowser(entryFile, createSettingsSnapshot(), (progress) => {
+        blob = await processVideoInBrowser(entryFile, createSettingsSnapshot(entryId), (progress) => {
           updateProgress(entryId, progress)
         })
       }
@@ -705,6 +907,8 @@ export function useImageEditor() {
 
       if (runId === currentRunId(videoRunIds, entryId)) {
         serverVideoJobIds.delete(entryId)
+        entryInitialEstimates.delete(entryId)
+        entryVideoMetadata.delete(entryId)
         updateEntry(entryId, { processingQueued: false })
         updateProgress(entryId, null)
       }
@@ -715,6 +919,8 @@ export function useImageEditor() {
     nextRunId(videoRunIds, entryId)
     const jobId = serverVideoJobIds.get(entryId)
     serverVideoJobIds.delete(entryId)
+    entryInitialEstimates.delete(entryId)
+    entryVideoMetadata.delete(entryId)
     updateEntry(entryId, { processingQueued: false, serverJobId: null })
     updateProgress(entryId, null)
     setEntryStatus(entryId, 'cancelled', 'Traitement annule.')
@@ -753,7 +959,7 @@ export function useImageEditor() {
     setEntryStatus(entryId, 'processing')
 
     try {
-      if (activeMode.value === 'server') {
+      if (activeModeForEntry(entryId) === 'server') {
         await processOnServerForEntry(entryId)
       } else {
         await processInWorkerForEntry(entryId)
@@ -782,8 +988,6 @@ export function useImageEditor() {
   async function loadFile(nextFile: File) {
     file.value = nextFile
     originalImageData.value = null
-    settings.excludedFaceIds = []
-    videoServerOnly.value = false
 
     const mediaKind = nextFile.type.startsWith('video/') ? 'video' : 'image'
     const entryId = crypto.randomUUID()
@@ -805,18 +1009,32 @@ export function useImageEditor() {
       processingMessage: '',
       processingQueued: false,
       estimatedRemainingMs: null,
-      serverJobId: null
+      serverJobId: null,
+      settings: {
+        ...settings,
+        excludedFaceIds: []
+      },
+      autoResolvedMode: 'client',
+      videoServerOnly: false,
+      isUploading: false
     })
     void persistEntry(entryId)
 
     const inferredMode = await inferProcessingTarget(nextFile.size)
-    autoResolvedMode.value = mediaKind === 'video' && (nextFile.size > 12 * 1024 * 1024 || inferredMode !== 'client')
+    const resolvedMode = mediaKind === 'video' && (nextFile.size > 12 * 1024 * 1024 || inferredMode !== 'client')
       ? 'server'
       : inferredMode
+
+    if (currentEntry.value) {
+      currentEntry.value.autoResolvedMode = resolvedMode
+    }
+
     safariVideoModalOpen.value = mediaKind === 'video' && isSafari
 
     if (mediaKind === 'video') {
-      await checkVideoCompatibility(nextFile)
+      console.debug('[solifloute] chargement video', { entryId, fileName: nextFile.name, size: nextFile.size, resolvedMode })
+      await checkVideoCompatibility(entryId, nextFile)
+      void setInitialVideoEstimate(entryId)
       void persistEntry(entryId)
       return entryId
     }
@@ -830,16 +1048,30 @@ export function useImageEditor() {
     return entryId
   }
 
-  async function checkVideoCompatibility(nextFile: File) {
-    if (!import.meta.client || !currentEntry.value) {
+  async function checkVideoCompatibility(entryId: string, nextFile: File) {
+    const entry = uploadEntries.value.find(candidate => candidate.id === entryId)
+
+    if (!import.meta.client || !entry) {
+      console.debug('[solifloute] compat: entree introuvable', { entryId })
       return
     }
 
-    const metadata = await readVideoMetadata(nextFile).catch(() => null)
+    const metadata = await readVideoMetadata(nextFile).catch((cause) => {
+      console.debug('[solifloute] compat: echec lecture metadonnees video', { entryId, cause: cause instanceof Error ? cause.message : String(cause) })
+      return null
+    })
 
     if (!metadata) {
       return
     }
+
+    if (metadata.width > 0 && metadata.height > 0 && metadata.duration > 0) {
+      entryVideoMetadata.set(entryId, metadata)
+    }
+
+    console.debug('[solifloute] compat: metadonnees lues', { entryId, metadata })
+
+    void setInitialVideoEstimate(entryId)
 
     const browserCannotDecode = metadata.width <= 0 || metadata.height <= 0
 
@@ -850,8 +1082,8 @@ export function useImageEditor() {
         height: metadata.height,
         duration: metadata.duration
       })
-      videoServerOnly.value = true
-      autoResolvedMode.value = 'server'
+      entry.videoServerOnly = true
+      entry.autoResolvedMode = 'server'
 
       return
     }
@@ -860,19 +1092,27 @@ export function useImageEditor() {
     const tooBig = metadata.width * metadata.height > MAX_BROWSER_VIDEO_PIXELS
 
     if (tooLong || tooBig) {
-      videoServerOnly.value = true
-      autoResolvedMode.value = 'server'
+      entry.videoServerOnly = true
+      entry.autoResolvedMode = 'server'
 
-      updateCurrentEntry({
-        warning: 'Cette video depasse les limites du traitement navigateur. Le mode serveur est force.'
-      })
+      if (entry.settings.processingMode !== 'cloud') {
+        entry.settings.processingMode = 'server'
+      }
+
+      entry.warning = 'Cette video depasse les limites du traitement navigateur. Les modes serveur et Cloud restent disponibles.'
     }
   }
 
   function toggleExcludedFace(faceId: string) {
-    settings.excludedFaceIds = settings.excludedFaceIds.includes(faceId)
-      ? settings.excludedFaceIds.filter(id => id !== faceId)
-      : [...settings.excludedFaceIds, faceId]
+    const entry = currentEntry.value
+
+    if (!entry) {
+      return
+    }
+
+    entry.settings.excludedFaceIds = entry.settings.excludedFaceIds.includes(faceId)
+      ? entry.settings.excludedFaceIds.filter(id => id !== faceId)
+      : [...entry.settings.excludedFaceIds, faceId]
   }
 
   async function addManualFace(bounds: Pick<Face, 'x' | 'y' | 'width' | 'height'>) {
@@ -891,7 +1131,7 @@ export function useImageEditor() {
       ]
     })
 
-    if (activeMode.value === 'client' && originalImageData.value) {
+    if (activeModeForEntry(currentEntryId.value ?? '') === 'client' && originalImageData.value) {
       try {
         await refreshClientPreview()
       } catch (cause) {
@@ -955,6 +1195,11 @@ export function useImageEditor() {
         pendingResumes.push({ entryId: item.id, jobId: serverJobId })
       }
 
+      const inferredMode = await inferProcessingTarget(item.originalBlob.size)
+      const resolvedMode = item.mediaKind === 'video' && (item.originalBlob.size > 12 * 1024 * 1024 || inferredMode !== 'client')
+        ? 'server'
+        : inferredMode
+
       restored.push({
         id: item.id,
         createdAt: item.createdAt,
@@ -973,7 +1218,11 @@ export function useImageEditor() {
         processingMessage: '',
         processingQueued: false,
         estimatedRemainingMs: null,
-        serverJobId
+        serverJobId,
+        settings: sanitizeEntrySettings(item.settings),
+        autoResolvedMode: resolvedMode,
+        videoServerOnly: false,
+        isUploading: false
       })
     }
 
@@ -992,6 +1241,13 @@ export function useImageEditor() {
     for (const pending of pendingResumes) {
       void resumeServerVideoJob(pending.entryId, pending.jobId)
     }
+
+    for (const item of restored) {
+      if (item.mediaKind === 'video') {
+        const entryFile = entryFiles.get(item.id)
+        void checkVideoCompatibility(item.id, entryFile ?? new File([], item.fileName))
+      }
+    }
   }
 
   if (import.meta.client) {
@@ -1008,75 +1264,72 @@ export function useImageEditor() {
     Object.assign(window, { __solifloute: debugApi })
   }
 
-  watch(() => settings.confidenceThreshold, async () => {
-    if (mediaKind.value === 'image' && file.value && originalImageData.value) {
-      await detectFaces()
-    }
-  })
-
-  watch(() => settings.detectionModel, async () => {
-    if (!import.meta.client) {
-      return
-    }
-
-    clientDetector.value = useFaceDetector(
-      getClientModelUrl(settings.detectionModel),
-      DETECTION_MODELS[settings.detectionModel].modelType
-    )
-
-    if (mediaKind.value === 'image' && file.value && originalImageData.value) {
-      await detectFaces()
-    }
-  })
+  let watchedSettingsEntryId: string | null = null
+  let watchedSettingsSnapshot: string | null = null
 
   watch(
-    () => [settings.processingMode, settings.blurIntensity, settings.excludedFaceIds.join('|')],
-    async () => {
-      if (
-        mediaKind.value !== 'image'
-        || !file.value
-        || !originalImageData.value
-        || activeMode.value !== 'client'
-        || status.value === 'detecting'
-      ) {
+    () => currentEntry.value?.settings,
+    async (nextSettings) => {
+      if (!import.meta.client || !nextSettings || !currentEntry.value) {
         return
       }
 
-      try {
-        await refreshClientPreview()
-      } catch (cause) {
-        setStatus(
-          'error',
-          cause instanceof Error ? cause.message : 'La mise a jour de l apercu a echoue.'
+      const entryId = currentEntry.value.id
+      const snapshot = JSON.stringify({
+        confidenceThreshold: nextSettings.confidenceThreshold,
+        blurIntensity: nextSettings.blurIntensity,
+        processingMode: nextSettings.processingMode,
+        excludedFaceIds: nextSettings.excludedFaceIds,
+        detectionModel: nextSettings.detectionModel
+      })
+
+      // First observation of an entry's settings (entry switch or load) is
+      // handled by loadFile/restoreEntries: only react to subsequent edits.
+      if (watchedSettingsEntryId !== entryId || watchedSettingsSnapshot === snapshot) {
+        watchedSettingsEntryId = entryId
+        watchedSettingsSnapshot = snapshot
+        return
+      }
+
+      const previous = JSON.parse(watchedSettingsSnapshot!) as EditorSettings
+      watchedSettingsEntryId = entryId
+      watchedSettingsSnapshot = snapshot
+
+      const modelChanged = nextSettings.detectionModel !== previous.detectionModel
+      const sensitivityChanged = nextSettings.confidenceThreshold !== previous.confidenceThreshold
+      const previewChanged = modelChanged
+        || sensitivityChanged
+        || nextSettings.blurIntensity !== previous.blurIntensity
+        || nextSettings.excludedFaceIds.join('|') !== previous.excludedFaceIds.join('|')
+        || nextSettings.processingMode !== previous.processingMode
+
+      if (modelChanged) {
+        clientDetector.value = useFaceDetector(
+          getClientModelUrl(nextSettings.detectionModel),
+          DETECTION_MODELS[nextSettings.detectionModel].modelType
         )
       }
-    }
-  )
 
-  watch(
-    () => settings.processingMode,
-    () => {
-      if (isSafariVideoForcedToServer.value && settings.processingMode !== 'server') {
-        safariVideoModalOpen.value = true
+      const entry = currentEntry.value
+
+      if (entry.mediaKind === 'video') {
+        void setInitialVideoEstimate(entryId)
+
+        if (isSafari && nextSettings.processingMode !== 'server') {
+          safariVideoModalOpen.value = true
+        }
+      } else if (file.value && originalImageData.value && status.value !== 'detecting') {
+        if (sensitivityChanged || modelChanged) {
+          await detectFaces()
+        } else if (activeModeForEntry(entryId) === 'client' && previewChanged) {
+          await refreshClientPreview()
+        }
       }
-    }
-  )
 
-  watch(serverOnly, (forced) => {
-    if (forced) {
-      settings.processingMode = 'server'
-    }
-  })
-
-  watch(
-    () => ({
-      confidenceThreshold: settings.confidenceThreshold,
-      blurIntensity: settings.blurIntensity,
-      processingMode: settings.processingMode
-    }),
-    (value) => {
-      persistSettings(value)
-    }
+      persistSettings(nextSettings)
+      void persistEntry(entryId)
+    },
+    { deep: true }
   )
 
   return {
@@ -1088,8 +1341,6 @@ export function useImageEditor() {
     status,
     error,
     settings,
-    activeMode,
-    serverOnly,
     originalPreviewUrl,
     processedPreviewUrl,
     processingProgress,
@@ -1097,7 +1348,8 @@ export function useImageEditor() {
     processingMessage,
     lastDurationMs,
     safariVideoModalOpen,
-    isSafariVideoForcedToServer,
+    activeModeForEntry,
+    isEntryServerOnly,
     loadFile,
     detectFaces,
     processEntry,
@@ -1105,6 +1357,7 @@ export function useImageEditor() {
     cancelEntryProcessing,
     toggleExcludedFace,
     addManualFace,
-    closeSafariVideoModal
+    closeSafariVideoModal,
+    entryInitialEstimates
   }
 }

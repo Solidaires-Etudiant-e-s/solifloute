@@ -7,7 +7,7 @@ import {
   getPaddedInputSize
 } from './faceDetectionCore'
 
-const isNodeRuntime = typeof window === 'undefined' && typeof process !== 'undefined'
+const isNodeRuntime = typeof window === 'undefined' && typeof self === 'undefined' && typeof process !== 'undefined'
 
 const DEFAULT_MODEL_PATH = isNodeRuntime
   ? `${process.cwd()}/public/models/centerface.onnx`
