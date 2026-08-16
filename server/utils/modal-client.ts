@@ -324,11 +324,12 @@ export async function detectVideoFacesOnModal(
     try {
       videoId = await prepareVideoOnModal(inputPath, signal)
     } catch (error) {
-      if (error instanceof Error && error.message.includes('404')) {
-        // /prepare-video is unavailable: we cannot upload once and reuse it, so
-        // collapse to a single full-video request instead of re-uploading the
-        // whole file once per segment (which would buffer it N times in memory).
-        console.warn('[solifloute:modal] /prepare-video endpoint unavailable, collapsing to a single upload')
+      if (error instanceof Error && /404|invalid function|not found/i.test(error.message)) {
+        // /prepare-video is unavailable (endpoint not deployed/registered, or
+        // the gateway does not recognize it). We cannot upload once and reuse
+        // it, so collapse to a single full-video request instead of re-uploading
+        // the whole file once per segment (which would buffer it N times).
+        console.warn('[solifloute:modal] /prepare-video unavailable, collapsing to a single upload:', error.message)
         segments = [{ startFrame: 0, endFrame: frameCount }]
       } else {
         throw error
