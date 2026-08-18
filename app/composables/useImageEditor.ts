@@ -852,6 +852,9 @@ export function useImageEditor() {
 
     const runId = nextRunId(videoRunIds, entryId)
     const startedAt = Date.now()
+    umTrackEvent('video-job', {
+      mode: activeModeForEntry(entryId) === 'client' ? 'browser' : activeModeForEntry(entryId)
+    })
     setEntryStatus(entryId, 'processing')
     updateProgress(entryId, 0, 'Preparation du traitement video.')
     await setInitialVideoEstimate(entryId)
@@ -956,6 +959,9 @@ export function useImageEditor() {
       return
     }
 
+    umTrackEvent('image-job', {
+      mode: activeModeForEntry(entryId) === 'client' ? 'browser' : activeModeForEntry(entryId)
+    })
     setEntryStatus(entryId, 'processing')
 
     try {

@@ -1,13 +1,13 @@
 export default defineNuxtConfig({
   modules: [
     '@nuxt/eslint',
-    '@nuxt/ui'
+    '@nuxt/ui',
+    'nuxt-umami'
   ],
 
   devtools: {
     enabled: true
   },
-
   css: ['~/assets/css/main.css'],
 
   compatibilityDate: '2025-01-15',
@@ -40,5 +40,12 @@ export default defineNuxtConfig({
         braceStyle: '1tbs'
       }
     }
+  },
+
+  umami: {
+    id: process.env.UMAMI,
+    host: 'https://umami.solidaires-etudiant-e-s.org',
+    autoTrack: true,
+    ignoreLocalhost: true
   }
 })
